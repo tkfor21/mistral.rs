@@ -36,6 +36,11 @@ cargo fmt --all -- --check
 
 # Run clippy
 cargo clippy --workspace --tests --examples -- -D warnings
+
+# Regenerate generated docs after changing CLI args or server routes
+# (CLI reference, OpenAPI spec, Python stubs/examples); docs-check verifies they're current
+make docs-regen
+make docs-check
 ```
 
 ### Running Models
@@ -73,8 +78,12 @@ You should also look for a model.safetensors.index.json file for the model at ha
 - `mistralrs-vision/` - Image processing utilities
 - `mistralrs-quant/` - Quantization implementations (ISQ, GGUF, GPTQ, etc.)
 - `mistralrs-paged-attn/` - PagedAttention implementation
+- `mistralrs-flash-attn/` - Flash attention kernels
 - `mistralrs-audio/` - Audio processing
 - `mistralrs-mcp/` - Model Context Protocol client
+- `mistralrs-macros/` - Proc macros for tool definitions
+- `mistralrs-code-exec/` - Python code execution for the agentic runtime
+- `mistralrs-sandbox/` - OS-level sandbox for subprocesses (code execution, tools)
 
 ### Key Design Patterns
 
@@ -93,7 +102,7 @@ When adding new model architectures:
 2. Add pipeline support in `mistralrs-core/src/pipeline/`
 3. Update model detection in `mistralrs-core/src/pipeline/normal.rs`
 4. Add architecture enum variant in `mistralrs-core/src/lib.rs`
-5. Update CLI args in `mistralrs-cli/src/main.rs`
+5. Update CLI args in `mistralrs-cli/src/args/mod.rs` (subcommand enum + `#[command]` defs; `main.rs` only dispatches, command impls live in `mistralrs-cli/src/commands/`)
 
 When adding new quantization methods:
 1. Implement in `mistralrs-quant/src/`
