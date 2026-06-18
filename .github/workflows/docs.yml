@@ -2,7 +2,7 @@ name: docs
 
 on:
   push:
-    branches: ["master"]
+    branches: ["main"]
     paths:
       - "Cargo.lock"
       - "Cargo.toml"
@@ -54,11 +54,7 @@ jobs:
           node-version: "22"
 
       - name: Setup Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Regenerate docs artifacts
         working-directory: docs
