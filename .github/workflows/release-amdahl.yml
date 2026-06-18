@@ -1,0 +1,57 @@
+name: release-amdahl
+
+# Publishes the macOS-arm64 `mistralrs` (Metal) binary that amdahl's
+# amdahl-local-inference crate downloads + SHA-256-verifies. Manual-only
+# (workflow_dispatch): it watches no tags, so it is fully decoupled from this
+# repo's v*.*.* `release.yml` and from any consumer's tag-release process. Only
+# write-access collaborators can run it, so no outside party can spend Actions
+# minutes. The asset is the bare executable named `mistralrs` (not a tarball) so
+# the consumer can curl + chmod +x + run it directly.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create/upload to (the amdahl pin uses amdahl-v0.8.9)."
+        required: true
+        default: "amdahl-v0.8.9"
+      ref:
+        description: "Git ref (branch or commit) to build."
+        required: true
+        default: "master"
+      dry_run:
+        description: "Build + smoke-test only; upload nothing."
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-amdahl-${{ github.event.inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release --locked --features "metal" -p mistralrs-cli
+      - name: Smoke test (binary runs standalone)
+        run: ./target/release/mistralrs --version
+      - name: Publish bare `mistralrs` asset
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag }}
+          prerelease: true
+          make_latest: false
+          files: target/release/mistralrs
