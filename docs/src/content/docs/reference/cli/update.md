@@ -2,7 +2,7 @@
 title: "mistralrs update"
 description: "Update a prebuilt install to the latest release"
 sidebar:
-  order: 12
+  order: 13
 ---
 
 <!-- Generated from clap definitions by mistralrs-cli docgen. Do not edit. -->
@@ -15,5 +15,5 @@ mistralrs update [OPTIONS]
 
 | Option | Default | Description |
 |---|---|---|
-| `--tag <TAG>` |  | Install a specific release tag instead of the latest (e.g. v0.8.9) |
+| `--tag <TAG>` |  | Install a specific release tag instead of the latest (e.g. v0.8.17) |
 

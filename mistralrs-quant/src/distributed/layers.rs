@@ -357,12 +357,8 @@ impl QuantizedSerde for RowParallelLayer {
     fn name(&self) -> &'static str {
         self.weight.name()
     }
-    fn serialize_directly(
-        &self,
-        prefix: &str,
-        ty: crate::IsqType,
-    ) -> Result<Vec<crate::UqffTensor>> {
-        let mut tensors = self.weight.serialize_directly(prefix, ty)?;
+    fn serialize_uqff(&self, prefix: &str, ty: crate::IsqType) -> Result<Vec<crate::UqffTensor>> {
+        let mut tensors = self.weight.serialize_uqff(prefix, ty)?;
         if let Some(bias) = &self.bias {
             let bias_key = format!("{prefix}.bias");
             tensors.retain(|tensor| tensor.name() != bias_key);
@@ -687,12 +683,8 @@ impl QuantizedSerde for ColumnParallelLayer {
     fn name(&self) -> &'static str {
         self.weight.name()
     }
-    fn serialize_directly(
-        &self,
-        prefix: &str,
-        ty: crate::IsqType,
-    ) -> Result<Vec<crate::UqffTensor>> {
-        let mut tensors = self.weight.serialize_directly(prefix, ty)?;
+    fn serialize_uqff(&self, prefix: &str, ty: crate::IsqType) -> Result<Vec<crate::UqffTensor>> {
+        let mut tensors = self.weight.serialize_uqff(prefix, ty)?;
         if let Some(bias) = &self.bias {
             let bias_key = format!("{prefix}.bias");
             tensors.retain(|tensor| tensor.name() != bias_key);
@@ -722,9 +714,11 @@ impl ReplicatedLayer {
                 };
                 let layer: Arc<dyn QuantMethod> =
                     Arc::new(UnquantLinear::new(QuantMethodConfig::Unquantized(lin))?);
-                let layer = spawn_pending_isq(layer, Some(immediate_isq), dev, &params);
+                let module_key = vb.prefix();
+                let layer =
+                    spawn_pending_isq(layer, Some(immediate_isq), dev, &params, module_key.clone());
                 vb.tracker().add_module(crate::TrackedModule {
-                    key: vb.prefix(),
+                    key: module_key,
                     ct: layer.clone(),
                     ty: Some(immediate_isq),
                     shard: None,
@@ -734,9 +728,10 @@ impl ReplicatedLayer {
             if params.capture != crate::IsqCaptureMode::Immediate {
                 let layer: Arc<dyn QuantMethod> =
                     Arc::new(UnquantLinear::new(QuantMethodConfig::Unquantized(lin))?);
-                let layer = spawn_pending_isq(layer, None, dev, &params);
+                let module_key = vb.prefix();
+                let layer = spawn_pending_isq(layer, None, dev, &params, module_key.clone());
                 vb.tracker().add_module(crate::TrackedModule {
-                    key: vb.prefix(),
+                    key: module_key,
                     ct: layer.clone(),
                     ty: params.ty,
                     shard: None,
@@ -1018,12 +1013,8 @@ impl QuantizedSerde for ReplicatedLayer {
     fn name(&self) -> &'static str {
         self.0.name()
     }
-    fn serialize_directly(
-        &self,
-        prefix: &str,
-        ty: crate::IsqType,
-    ) -> Result<Vec<crate::UqffTensor>> {
-        self.0.serialize_directly(prefix, ty)
+    fn serialize_uqff(&self, prefix: &str, ty: crate::IsqType) -> Result<Vec<crate::UqffTensor>> {
+        self.0.serialize_uqff(prefix, ty)
     }
 }
 

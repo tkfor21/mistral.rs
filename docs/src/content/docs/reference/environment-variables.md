@@ -87,14 +87,12 @@ These are read by build scripts, not at runtime.
 |---|---|
 | `MISTRALRS_METAL_PRECOMPILE` | `MISTRALRS_METAL_PRECOMPILE=0` skips Metal kernel precompilation at build time; kernels are compiled at runtime on first use. |
 | `CUDA_NVCC_FLAGS` | Extra compiler options passed to CUDA builds. |
-| `MISTRALRS_INSTALL_TAG` | Pins the installers to a specific release tag (e.g. `v0.8.9`): the prebuilt is downloaded from that release, and a source build checks out that git tag. Default is the latest stable release (prebuilt) or latest `master` (source). |
+| `MISTRALRS_INSTALL_TAG` | Pins the installers to a specific release tag (e.g. `v0.8.17`): the prebuilt is downloaded from that release, and a source build checks out that git tag. Default is the latest stable release (prebuilt) or latest `master` (source). |
 | `MISTRALRS_INSTALL_FROM_SOURCE` | `MISTRALRS_INSTALL_FROM_SOURCE=1` makes the shell and PowerShell installers skip the prebuilt download and build from the latest `master` (bleeding edge) instead of the latest stable release. |
 | `MISTRALRS_INSTALL_NCCL` | `MISTRALRS_INSTALL_NCCL=1` forces the shell and PowerShell installers to add the `nccl` feature for CUDA builds even if NCCL is not detected. |
 | `MISTRALRS_INSTALL_NO_NCCL` | `MISTRALRS_INSTALL_NO_NCCL=1` makes the shell and PowerShell installers skip the `nccl` feature. |
 | `MISTRALRS_INSTALL_YES` | `MISTRALRS_INSTALL_YES=1` auto-confirms every installer prompt (non-interactive installs for CI/containers; used by `mistralrs update`). |
 | `MISTRALRS_INSTALL_IGNORE_FFMPEG` | `MISTRALRS_INSTALL_IGNORE_FFMPEG=1` skips the installer's FFmpeg step, leaving any existing FFmpeg untouched. |
-| `MISTRALRS_BUILD_NCCL` | `MISTRALRS_BUILD_NCCL=1` forces `scripts/build_wheels.py` to add `nccl` to Linux CUDA wheels. |
-| `MISTRALRS_BUILD_NO_NCCL` | `MISTRALRS_BUILD_NO_NCCL=1` makes `scripts/build_wheels.py` skip `nccl` for CUDA wheels. |
 | `MISTRALRS_GIT_REVISION` | Git revision embedded in the binary by the build script. |
 
 ## Internal

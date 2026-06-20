@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::File,
     path::{Path, PathBuf},
     str::FromStr,
@@ -20,6 +20,10 @@ use crate::utils::progress::configure_progress_bar;
 
 pub(crate) const UQFF_RESIDUAL_SAFETENSORS: &str = "residual.safetensors";
 pub const UQFF_MULTI_FILE_DELIMITER: &str = ";";
+const UQFF_METADATA_PRODUCER: &str = "uqff.producer";
+const UQFF_METADATA_VERSION: &str = "uqff.version";
+const UQFF_METADATA_MISTRALRS_VERSION: &str = "uqff.producer.mistralrs.version";
+const UQFF_METADATA_MISTRALRS_GIT_REVISION: &str = "uqff.producer.mistralrs.git_revision";
 
 pub(crate) struct WeightLoadingState {
     pub(crate) from_uqff: bool,
@@ -297,6 +301,10 @@ pub struct UqffWriteConfig {
     pub output: PathBuf,
     #[serde(default)]
     pub types: Vec<IsqType>,
+    #[serde(default)]
+    pub base_model: Option<String>,
+    #[serde(default)]
+    pub repo_id: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for UqffWriteConfig {
@@ -312,12 +320,21 @@ impl<'de> Deserialize<'de> for UqffWriteConfig {
                 output: PathBuf,
                 #[serde(default)]
                 types: Vec<IsqType>,
+                #[serde(default)]
+                base_model: Option<String>,
+                #[serde(default)]
+                repo_id: Option<String>,
             },
         }
 
         match Repr::deserialize(deserializer)? {
             Repr::Path(output) => Ok(Self::from_output(output)),
-            Repr::Config { output, types } => Ok(Self::with_types(output, types)),
+            Repr::Config {
+                output,
+                types,
+                base_model,
+                repo_id,
+            } => Ok(Self::with_types(output, types).with_report_metadata(base_model, repo_id)),
         }
     }
 }
@@ -341,11 +358,28 @@ impl UqffWriteConfig {
         Self {
             output,
             types: Vec::new(),
+            base_model: None,
+            repo_id: None,
         }
     }
 
     pub fn with_types(output: PathBuf, types: Vec<IsqType>) -> Self {
-        Self { output, types }
+        Self {
+            output,
+            types,
+            base_model: None,
+            repo_id: None,
+        }
+    }
+
+    pub fn with_report_metadata(
+        mut self,
+        base_model: Option<String>,
+        repo_id: Option<String>,
+    ) -> Self {
+        self.base_model = base_model;
+        self.repo_id = repo_id;
+        self
     }
 
     /// Build from an ISQ specifier; numeric shorthands expand to all variants, platform-preferred first.
@@ -357,6 +391,8 @@ impl UqffWriteConfig {
 pub(crate) struct UqffWriteRequest<'a> {
     pub output: PathBuf,
     pub types: Vec<IsqType>,
+    pub base_model: Option<String>,
+    pub repo_id: Option<String>,
     pub layers: Vec<TrackedModule>,
     pub residual: Vec<(String, Tensor)>,
     pub full_ser: UqffFullSer<'a>,
@@ -369,7 +405,9 @@ pub(crate) fn write_uqff_artifacts(request: UqffWriteRequest<'_>) -> Result<()> 
     let UqffWriteRequest {
         output,
         types,
-        layers,
+        base_model,
+        repo_id,
+        mut layers,
         residual,
         full_ser,
         imatrix,
@@ -383,6 +421,7 @@ pub(crate) fn write_uqff_artifacts(request: UqffWriteRequest<'_>) -> Result<()> 
             anyhow::bail!("UQFF serialization does not support {ty}.");
         }
     }
+    layers.sort_by(|a, b| a.key.cmp(&b.key));
 
     let mut output_paths = if types.len() == 1 {
         if output.extension().is_none_or(|ext| ext != "uqff") {
@@ -416,11 +455,42 @@ pub(crate) fn write_uqff_artifacts(request: UqffWriteRequest<'_>) -> Result<()> 
         output.clone()
     };
 
-    for (ty, path) in output_paths {
-        write_uqff_type(ty, &path, &layers, ty == runtime_ty, &imatrix)?;
+    let total_types = output_paths.len();
+    let mut report_outputs = Vec::with_capacity(total_types);
+    for (idx, (ty, path)) in output_paths.into_iter().enumerate() {
+        let output_report = write_uqff_type(
+            ty,
+            &path,
+            &layers,
+            ty == runtime_ty,
+            &imatrix,
+            idx + 1,
+            total_types,
+        )?;
+        report_outputs.push(output_report);
     }
     info!("In-memory model is quantized as {runtime_ty}.");
-    write_uqff_metadata(&metadata_parent, residual, full_ser)
+    write_uqff_metadata(&metadata_parent, residual, full_ser)?;
+    let report = mistralrs_quant::UqffReport {
+        schema: 1,
+        generated_by: mistralrs_quant::UqffGeneratedBy {
+            tool: "mistralrs quantize".to_string(),
+            mistralrs_version: Some(crate::MISTRALRS_VERSION.to_string()),
+            git_revision: Some(crate::MISTRALRS_GIT_REVISION.to_string()),
+        },
+        base_model,
+        repo_id,
+        uqff_version: format!(
+            "{}.{}.{}",
+            mistralrs_quant::UQFF_VERSION_MAJOR,
+            mistralrs_quant::UQFF_VERSION_MINOR,
+            mistralrs_quant::UQFF_VERSION_PATCH
+        ),
+        outputs: report_outputs,
+    };
+    let report_path = mistralrs_quant::write_uqff_report(&metadata_parent, &report)?;
+    info!("Wrote UQFF report to `{}`.", report_path.display());
+    Ok(())
 }
 
 fn write_uqff_type(
@@ -429,9 +499,11 @@ fn write_uqff_type(
     layers: &[TrackedModule],
     swap_runtime: bool,
     imatrix: &std::collections::HashMap<String, Vec<f32>>,
-) -> Result<()> {
+    type_index: usize,
+    type_count: usize,
+) -> Result<mistralrs_quant::UqffOutputReport> {
     tracing::info!(
-        "Serializing {} {ty} UQFF layers to `{}`.",
+        "Serializing {type_index}/{type_count}: {} {ty} UQFF layers to `{}`.",
         layers.len(),
         serialized.display()
     );
@@ -449,17 +521,25 @@ fn write_uqff_type(
 
     let bar = ProgressBar::new(layers.len() as u64);
     configure_progress_bar(&bar);
+    bar.set_prefix(format!("{type_index}/{type_count} {ty}"));
     bar.set_style(
         ProgressStyle::default_bar()
-            .template("[{elapsed_precise}] [{bar:40.red/magenta}] {pos}/{len} ({eta})")
+            .template(
+                "{prefix} [{elapsed_precise}] [{bar:40.red/magenta}] {pos}/{len} ({eta}) {msg}",
+            )
             .unwrap()
             .progress_chars("#>-"),
     );
+    bar.set_message("starting");
+    bar.tick();
 
     let mut seen = HashSet::new();
     let mut current_chunk = Vec::new();
     let mut current_bytes = 0usize;
     let mut shard_index = 0u64;
+    let mut shards = Vec::new();
+    let quant_report = mistralrs_quant::QuantizationReport::default();
+    let mut layer_reports = Vec::with_capacity(layers.len());
 
     for version in mistralrs_quant::uqff_version_tensors() {
         seen.insert(version.name().to_string());
@@ -467,7 +547,7 @@ fn write_uqff_type(
         current_chunk.push(version);
     }
 
-    // Quantization runs on the pool; the writer consumes results in layer order so the shard
+    // Quantization runs on the pool; the writer consumes results in key order so the shard
     // layout stays deterministic while quantize-N+1 overlaps with write-N.
     // Topology-pinned layers keep their type; `ty` is the default for the rest.
     let handles = mistralrs_quant::requantize_tracked(
@@ -476,13 +556,27 @@ fn write_uqff_type(
         mistralrs_quant::RequantizeResults::CpuStaged,
         |m| m.ty.unwrap_or(ty),
         &|key| imatrix.get(key).cloned(),
+        Some(quant_report.clone()),
     )?;
     let guard = mistralrs_quant::QuantizeOntoGuard::new();
     for (module, rx) in layers.iter().zip(handles.receivers) {
+        bar.set_message(module.key.clone());
+        bar.tick();
+        let resolved_ty = module.ty.unwrap_or(ty);
         let layer = rx
             .recv()
             .map_err(|e| anyhow::anyhow!("Requantize channel error: {e}"))??;
-        for tensor in layer.serialize_directly(&module.key, ty)? {
+        let serialized_tensors = layer.serialize_uqff(&module.key, resolved_ty)?;
+        let (stored, shape) =
+            mistralrs_quant::stored_type_from_tensors(&serialized_tensors, &module.key)?;
+        layer_reports.push(mistralrs_quant::UqffLayerReport {
+            module: module.key.clone(),
+            default_target: Some(ty.to_string()),
+            resolved_target: Some(resolved_ty.to_string()),
+            stored,
+            shape,
+        });
+        for tensor in serialized_tensors {
             let name = tensor.name().to_string();
             if !seen.insert(name.clone()) {
                 anyhow::bail!("Duplicate UQFF tensor key `{name}`.");
@@ -490,9 +584,11 @@ fn write_uqff_type(
             let tensor_bytes = tensor.nbytes();
             if !current_chunk.is_empty() && current_bytes + tensor_bytes > MAX_UQFF_SIZE_BYTES {
                 flush_uqff_shard(
+                    &bar,
                     parent,
                     &file_stem,
                     &mut shard_index,
+                    &mut shards,
                     &mut current_chunk,
                     &mut current_bytes,
                 )?;
@@ -501,9 +597,11 @@ fn write_uqff_type(
             current_chunk.push(tensor);
             if current_bytes >= MAX_UQFF_SIZE_BYTES {
                 flush_uqff_shard(
+                    &bar,
                     parent,
                     &file_stem,
                     &mut shard_index,
+                    &mut shards,
                     &mut current_chunk,
                     &mut current_bytes,
                 )?;
@@ -520,7 +618,7 @@ fn write_uqff_type(
                     target,
                     &std::sync::atomic::AtomicUsize::new(0),
                     None,
-                    guard.clone(),
+                    guard.clone().with_module_key(module.key.clone()),
                 )?
             };
             module.ct.replace(layer);
@@ -529,20 +627,50 @@ fn write_uqff_type(
     }
 
     flush_uqff_shard(
+        &bar,
         parent,
         &file_stem,
         &mut shard_index,
+        &mut shards,
         &mut current_chunk,
         &mut current_bytes,
     )?;
     bar.finish_and_clear();
-    Ok(())
+    let output_report = mistralrs_quant::build_output_report_from_layers(
+        ty.to_string(),
+        shards,
+        layer_reports,
+        &quant_report,
+    );
+    if output_report.fallback_count == 0 {
+        info!("UQFF {ty}: {} layers, no fallbacks.", output_report.layers);
+    } else {
+        info!(
+            "UQFF {ty}: {} layers, {} fallback layer{}.",
+            output_report.layers,
+            output_report.fallback_count,
+            if output_report.fallback_count == 1 {
+                ""
+            } else {
+                "s"
+            }
+        );
+    }
+    info!(
+        "Finished serializing {type_index}/{type_count}: {ty} UQFF to `{}` ({} shard{}).",
+        serialized.display(),
+        shard_index,
+        if shard_index == 1 { "" } else { "s" }
+    );
+    Ok(output_report)
 }
 
 fn flush_uqff_shard(
+    bar: &ProgressBar,
     parent: &Path,
     file_stem: &str,
     shard_index: &mut u64,
+    shards: &mut Vec<String>,
     current_chunk: &mut Vec<UqffTensor>,
     current_bytes: &mut usize,
 ) -> Result<()> {
@@ -551,16 +679,21 @@ fn flush_uqff_shard(
     }
 
     let shard_path = parent.join(format!("{file_stem}-{shard_index}.uqff"));
-    info!(
-        "Writing shard {} to `{}`",
-        shard_index,
-        shard_path.display()
-    );
+    bar.suspend(|| {
+        info!(
+            "Writing shard {} to `{}`",
+            shard_index,
+            shard_path.display()
+        );
+    });
     safetensors::serialize_to_file(
         current_chunk.iter().map(|tensor| (tensor.name(), tensor)),
-        None,
+        Some(uqff_safetensors_metadata()),
         &shard_path,
     )?;
+    if let Some(name) = shard_path.file_name().and_then(|name| name.to_str()) {
+        shards.push(name.to_string());
+    }
     *shard_index += 1;
     current_chunk.clear();
     *current_bytes = 0;
@@ -587,7 +720,7 @@ fn write_uqff_metadata(
         residual.len(),
         residual_out.display()
     );
-    safetensors::serialize_to_file(residual, None, &residual_out)?;
+    safetensors::serialize_to_file(residual, Some(uqff_safetensors_metadata()), &residual_out)?;
 
     let UqffFullSer {
         tokenizer,
@@ -713,6 +846,29 @@ fn write_uqff_metadata(
     }
 
     Ok(())
+}
+
+fn uqff_safetensors_metadata() -> HashMap<String, String> {
+    HashMap::from([
+        (UQFF_METADATA_PRODUCER.to_string(), "mistral.rs".to_string()),
+        (
+            UQFF_METADATA_VERSION.to_string(),
+            format!(
+                "{}.{}.{}",
+                mistralrs_quant::UQFF_VERSION_MAJOR,
+                mistralrs_quant::UQFF_VERSION_MINOR,
+                mistralrs_quant::UQFF_VERSION_PATCH
+            ),
+        ),
+        (
+            UQFF_METADATA_MISTRALRS_VERSION.to_string(),
+            crate::MISTRALRS_VERSION.to_string(),
+        ),
+        (
+            UQFF_METADATA_MISTRALRS_GIT_REVISION.to_string(),
+            crate::MISTRALRS_GIT_REVISION.to_string(),
+        ),
+    ])
 }
 
 pub trait IsqModel {

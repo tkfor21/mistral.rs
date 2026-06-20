@@ -121,6 +121,12 @@ pub enum Command {
         default_quantize: QuantizeDefaultOptions,
     },
 
+    /// Inspect, report, or verify UQFF artifacts
+    Uqff {
+        #[command(subcommand)]
+        command: UqffCommand,
+    },
+
     /// Run system diagnostics and environment checks
     Doctor {
         /// Output JSON instead of human-readable text
@@ -208,7 +214,7 @@ pub enum Command {
 
     /// Update a prebuilt install to the latest release
     Update {
-        /// Install a specific release tag instead of the latest (e.g. v0.8.9)
+        /// Install a specific release tag instead of the latest (e.g. v0.8.17)
         #[arg(long)]
         tag: Option<String>,
     },
@@ -232,6 +238,82 @@ pub enum CacheCommand {
         /// Model ID (e.g., "Qwen/Qwen3-4B")
         #[arg(short = 'm', long)]
         model_id: String,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+pub enum UqffCommand {
+    /// Print or write a UQFF report
+    Report {
+        /// Hugging Face model ID or local path containing UQFF files
+        #[arg(short = 'm', long)]
+        model_id: String,
+
+        /// Quant group to inspect, such as 3, q3k, afq3, or all
+        #[arg(long)]
+        quant: Option<String>,
+
+        /// Hugging Face revision to use
+        #[arg(long)]
+        revision: Option<String>,
+
+        /// Write uqff_report.json beside the artifacts
+        #[arg(long)]
+        write: bool,
+
+        /// Print JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+
+        /// Base model ID to include in a written report
+        #[arg(long)]
+        base_model: Option<String>,
+
+        /// Hugging Face repo ID to include in a written report
+        #[arg(long)]
+        repo_id: Option<String>,
+    },
+
+    /// Validate UQFF artifact structure
+    Verify {
+        /// Hugging Face model ID or local path containing UQFF files
+        #[arg(short = 'm', long)]
+        model_id: String,
+
+        /// Quant group to inspect, such as 3, q3k, afq3, or all
+        #[arg(long)]
+        quant: Option<String>,
+
+        /// Hugging Face revision to use
+        #[arg(long)]
+        revision: Option<String>,
+
+        /// Print JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+
+        /// Fail on missing report/producer metadata or fallback layers
+        #[arg(long)]
+        strict: bool,
+
+        /// Allow same-major UQFF files with a newer minor version
+        #[arg(long)]
+        allow_newer_minor: bool,
+    },
+
+    /// Open a UQFF-aware tensor explorer
+    Inspect {
+        /// Hugging Face model ID or local path containing UQFF files
+        #[arg(short = 'm', long)]
+        model_id: String,
+
+        /// Quant group to inspect, such as 3, q3k, afq3, or all
+        #[arg(long)]
+        quant: Option<String>,
+
+        /// Hugging Face revision to use
+        #[arg(long)]
+        revision: Option<String>,
     },
 }
 
@@ -599,7 +681,7 @@ pub struct AgentCliOptions {
     #[arg(long)]
     pub code_exec_python: Option<PathBuf>,
 
-    /// Code execution timeout in seconds (default: 30). Requires code execution to be on.
+    /// Code execution timeout in seconds (default: 60). Requires code execution to be on.
     #[cfg(feature = "code-execution")]
     #[arg(long)]
     pub code_exec_timeout: Option<u64>,
@@ -615,7 +697,7 @@ pub struct AgentCliOptions {
     #[arg(long)]
     pub shell_path: Option<PathBuf>,
 
-    /// Shell execution timeout in seconds (default: 30). Requires shell execution to be on.
+    /// Shell execution timeout in seconds (default: 600). Requires shell execution to be on.
     #[cfg(feature = "code-execution")]
     #[arg(long)]
     pub shell_timeout: Option<u64>,

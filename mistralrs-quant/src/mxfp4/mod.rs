@@ -1,7 +1,9 @@
 use std::sync::{atomic::AtomicUsize, Arc};
 
 use candle_core::{DType, Device, Result, Tensor};
+use safetensors::tensor::Dtype;
 
+use crate::uqff::{UqffHeaderMatch, UqffLayerHeaderView};
 use crate::{
     IsqType, QuantMethod, QuantMethodConfig, QuantizeOntoGuard, QuantizedConfig, QuantizedSerde,
     QuantizedSerdeType, Shard, ShardedVarBuilder, UqffReader, UqffTensor,
@@ -31,6 +33,27 @@ pub struct MXFP4Layer {
     /// Optional bias: [N] or [num_experts, N]
     #[allow(dead_code)]
     bias: Option<Tensor>,
+}
+
+impl MXFP4Layer {
+    pub(crate) fn inspect_uqff_header(layer: &UqffLayerHeaderView<'_>) -> Option<UqffHeaderMatch> {
+        const WEIGHT_SUFFIXES: &[&str] = &["weight", "weight.format", "weight.scales"];
+        if layer.exact_weight_suffixes(WEIGHT_SUFFIXES) && layer.scalar("weight.format", Dtype::U8)
+        {
+            Some(UqffHeaderMatch {
+                serde_type: QuantizedSerdeType::Mxfp4,
+            })
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn stored_label_from_uqff_tensors(
+        _tensors: &[UqffTensor],
+        _prefix: &str,
+    ) -> Result<String> {
+        Ok("mxfp4".to_string())
+    }
 }
 
 impl QuantMethod for MXFP4Layer {
@@ -190,12 +213,7 @@ impl MXFP4Layer {
         }
     }
 
-    fn from_uqff_direct(
-        reader: &UqffReader,
-        key: &str,
-        device: &Device,
-        shard: Shard,
-    ) -> Result<Self> {
+    fn from_uqff(reader: &UqffReader, key: &str, device: &Device, shard: Shard) -> Result<Self> {
         // Logical dims: blocks pack 2 FP4 input elements per byte along the last dim.
         let blocks_dims = reader.tensor_dims(&format!("{key}.weight"))?;
         let mut dims = blocks_dims.clone();
@@ -759,7 +777,7 @@ impl QuantizedSerde for MXFP4Layer {
     fn isq_serde_supported(&self) -> bool {
         true
     }
-    fn serialize_directly(&self, prefix: &str, ty: IsqType) -> Result<Vec<UqffTensor>> {
+    fn serialize_uqff(&self, prefix: &str, ty: IsqType) -> Result<Vec<UqffTensor>> {
         if ty != IsqType::MXFP4 {
             candle_core::bail!("Cannot serialize MXFP4 layer as {ty}; actual type is MXFP4.");
         }
@@ -777,17 +795,15 @@ impl QuantizedSerde for MXFP4Layer {
         }
         Ok(data)
     }
-    fn deserialize_directly(
+    fn deserialize_uqff(
         reader: &UqffReader,
         prefix: &str,
         device: &Device,
         shard: Shard,
     ) -> Result<Arc<dyn QuantMethod>> {
-        Ok(Arc::new(Self::from_uqff_direct(
-            reader, prefix, device, shard,
-        )?))
+        Ok(Arc::new(Self::from_uqff(reader, prefix, device, shard)?))
     }
-    fn isq_type_from_uqff_direct(_reader: &UqffReader, _prefix: &str) -> Result<IsqType> {
+    fn isq_type_from_uqff(_reader: &UqffReader, _prefix: &str) -> Result<IsqType> {
         Ok(IsqType::MXFP4)
     }
 }

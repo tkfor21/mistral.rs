@@ -113,7 +113,11 @@ pub async fn run_quantize(model_type: QuantizeModelType, global: GlobalOptions) 
         std::fs::create_dir_all(&base_output)?;
         base_output.clone()
     };
-    let write_uqff = UqffWriteConfig::with_types(effective_output.clone(), expanded_isq.clone());
+    let write_uqff = UqffWriteConfig::with_types(effective_output.clone(), expanded_isq.clone())
+        .with_report_metadata(
+            Some(flag_base_model.clone().unwrap_or_else(|| model_id.clone())),
+            flag_repo_id.clone(),
+        );
     let requested = expanded_isq
         .iter()
         .map(ToString::to_string)
@@ -258,7 +262,7 @@ base_model_relation: quantized
 
 # `{base_model}`, UQFF quantization
 
-Run with [mistral.rs](https://github.com/EricLBuehler/mistral.rs). Documentation: [UQFF docs](https://ericlbuehler.github.io/mistral.rs/guides/perf/use-uqff/).
+Generated with [mistral.rs](https://github.com/EricLBuehler/mistral.rs) {mistralrs_version}. Documentation: [UQFF docs](https://ericlbuehler.github.io/mistral.rs/guides/perf/use-uqff/).
 
 1) **Flexible** 🌀: Multiple quantization formats in *one* file format with *one* framework to run them all.
 2) **Reliable** 🔒: Compatibility ensured with *embedded* and *checked* semantic versioning information from day 1.
@@ -285,7 +289,8 @@ irm https://raw.githubusercontent.com/EricLBuehler/mistral.rs/master/install.ps1
 
 |Quantization|Command|
 |--|--|
-"#
+"#,
+        mistralrs_version = mistralrs_core::MISTRALRS_VERSION,
     );
 
     let model_type_flag = if is_multimodal {

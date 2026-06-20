@@ -6,7 +6,7 @@ description: Layout of the UQFF quantized model file format.
 UQFF is the native mistral.rs quantized file format. To use UQFF models, see the [UQFF guide](/mistral.rs/guides/quantization/uqff/); knowledge of the layout is not required.
 
 :::caution
-UQFF 1.0 is not compatible with files produced by earlier mistral.rs releases (pre-1.0). Old files will fail with an error; regenerate them with `mistralrs quantize`.
+UQFF 1.x is not compatible with files produced by earlier mistral.rs releases (pre-1.0). Old files will fail with an error; regenerate them with `mistralrs quantize`.
 :::
 
 ## File structure
@@ -23,17 +23,19 @@ A loader is pointed at one or more shard files (`from_uqff`); the residual safet
 
 Each `.uqff` shard is a standard safetensors file with named entries. Every quantized layer is self-describing:
 
-- `<key>.weight` - the quantized data (raw blocks for GGML-family types, packed tensors for AFQ/MXFP4/FP8; see [quantization types](/mistral.rs/reference/quantization-types/)).
+- `<key>.weight` - the layer data (raw blocks for GGML-family types, packed tensors for AFQ/MXFP4/FP8, or a native safetensors tensor for unquantized fallback layers; see [quantization types](/mistral.rs/reference/quantization-types/)).
 - `<key>.weight.format` - a u8 tag naming the quantization family, used to dispatch the deserializer.
 - Family-specific metadata next to it, e.g. `<key>.weight.dtype` and `<key>.weight.shape` for GGML types, `<key>.weight.scales`/`.bits`/`.group_size` for AFQ.
 - `<key>.bias` when the layer has one.
+
+Safetensors metadata includes informational producer fields: `uqff.producer`, `uqff.producer.mistralrs.version`, and `uqff.producer.mistralrs.git_revision`. These are recorded for provenance and are not checked by the loader.
 
 `<key>` is the layer's weight path (`model.layers.0.self_attn.q_proj`). MoE (Mixture of Experts) expert layers use three canonical keys per block: `<...>.experts.gate_proj`, `.up_proj`, `.down_proj`, each holding the stacked `[num_experts, out, in]` weights.
 
 Because every layer self-describes, a single file may mix quantization types. Two cases produce a mixed file:
 
 - Topology-pinned layers (assigned a specific type by a [topology](/mistral.rs/guides/perf/topology/) config) keep their pinned type.
-- Layers whose shape cannot support the requested type fall back to another type per-layer.
+- Layers whose shape cannot support the requested type fall back per-layer. For example, AFQ layers whose input dimension is not divisible by the AFQ group size are stored unquantized.
 
 ## Sharding
 
@@ -42,6 +44,8 @@ The writer splits the tensor stream into `<stem>-0.uqff`, `<stem>-1.uqff`, ... w
 ## Version compatibility
 
 Each shard set carries three u32 scalar entries: `uqff.version.major`, `uqff.version.minor`, `uqff.version.patch`. Readers reject a different major version and reject a minor newer than they support; older minors within the same major are accepted. Files without version entries are rejected.
+
+UQFF 1.1 adds inline unquantized linear entries (`weight.format = Unquant`) so mixed files can preserve unsupported layer shapes without moving those weights into `residual.safetensors`.
 
 ## Tensor parallelism
 

@@ -7,9 +7,8 @@ use crate::{
     prefix_cacher::PrefixCacheManagerV2,
     sampler::Logprobs,
     sequence::{Sequence, SequenceRecognizer, SequenceState, StopReason},
-    tools::{parse_text_tools, ToolCallResponse, ToolCallType},
+    tools::ToolCallState,
 };
-use mistralrs_mcp::CalledFunction;
 
 use super::Pipeline;
 
@@ -25,27 +24,75 @@ macro_rules! fixup_sentencepiece {
     };
 }
 
+#[cfg(test)]
 fn parse_text_and_tool_calls(
     raw_text: &str,
-    matcher: Option<Arc<crate::tools::ToolCallingMatcher>>,
-) -> Result<(Option<String>, Vec<ToolCallResponse>)> {
-    let (text_new, tool_calls) =
-        parse_text_tools(raw_text, matcher).map_err(candle_core::Error::msg)?;
-    Ok((text_new.map(ToString::to_string), tool_calls))
+    state: Option<&mut ToolCallState>,
+) -> Result<(Option<String>, Vec<crate::tools::ToolCallResponse>)> {
+    let Some(state) = state else {
+        return Ok((Some(raw_text.to_string()), Vec::new()));
+    };
+    let parsed = state.finalize_for_response(raw_text, None, None)?;
+    Ok((parsed.content, parsed.tool_calls))
 }
 
+#[cfg(test)]
 fn parse_streaming_text_and_tool_calls(
     content_delta: Option<String>,
     raw_delta: &str,
     has_reasoning_parser: bool,
-    matcher: Option<Arc<crate::tools::ToolCallingMatcher>>,
-) -> Result<(Option<String>, Vec<ToolCallResponse>)> {
-    let raw_text = match content_delta {
-        Some(content_delta) => content_delta,
-        None if has_reasoning_parser => return Ok((None, Vec::new())),
-        None => raw_delta.to_string(),
+    state: Option<&mut ToolCallState>,
+) -> Result<(Option<String>, Vec<crate::tools::ToolCallResponse>)> {
+    let Some(state) = state else {
+        return Ok((
+            content_delta.or_else(|| Some(raw_delta.to_string())),
+            Vec::new(),
+        ));
     };
-    parse_text_and_tool_calls(raw_text.as_str(), matcher)
+    let parsed = state.parse_streaming(content_delta, raw_delta, has_reasoning_parser, false)?;
+    Ok((parsed.content, parsed.tool_calls))
+}
+
+fn activate_required_tool_call_grammar(
+    seq: &mut Sequence,
+    factory: Option<&Arc<llguidance::ParserFactory>>,
+    max_model_len: usize,
+    force_now: bool,
+) {
+    if !matches!(seq.recognizer, SequenceRecognizer::None) {
+        return;
+    }
+    let generated = seq.generated_len();
+    let max_generation_len = seq.max_generation_len(max_model_len);
+    let (_, remaining, deadline_tokens) =
+        ToolCallState::required_tool_call_deadline_status(generated, max_generation_len);
+    let grm = seq.tool_call_state.as_mut().and_then(|state| {
+        state.maybe_force_required_grammar(remaining, max_generation_len, force_now)
+    });
+    let Some(grm) = grm else {
+        return;
+    };
+    let Some(factory) = factory else {
+        tracing::warn!("Cannot force required tool call: llguidance is unavailable");
+        return;
+    };
+    match crate::pipeline::llg::constraint_from_llg_grammar(factory, grm) {
+        Ok(matcher) => {
+            seq.recognizer = SequenceRecognizer::Llguidance(Box::new(matcher));
+            if let Some(state) = seq.tool_call_state.as_mut() {
+                state.mark_grammar_active(true);
+            }
+            tracing::info!(
+                generated_tokens = generated,
+                remaining_tokens = remaining,
+                deadline_tokens,
+                "Forcing required tool call"
+            );
+        }
+        Err(e) => {
+            tracing::warn!("Failed to force required tool call grammar: {e}");
+        }
+    }
 }
 
 pub(crate) async fn finish_or_add_toks_to_seq(
@@ -64,7 +111,7 @@ pub(crate) async fn finish_or_add_toks_to_seq(
     // Include special tokens when tool calling is active (so tool parsers can see
     // delimiters like <tool_call>, [TOOL_CALLS], <|python_tag|>) or when think tag
     // mode is enabled (so <think>/<\/think> delimiters are visible in the output).
-    let include_special = seq.tools.is_some() || seq.needs_special_tokens();
+    let include_special = seq.tool_call_state.is_some() || seq.needs_special_tokens();
     let completion_bytes = tok_env
         .tok_trie()
         .decode_ext(&[logprobs.token], include_special);
@@ -72,16 +119,17 @@ pub(crate) async fn finish_or_add_toks_to_seq(
 
     // If we can have a tool and we got a tool, stop the sequence early.
     // Doesn't conflict with the logic below because it does the same thing anyway.
-    if let Some(ref t) = seq.tools {
-        if let Ok(Some(ref d)) = seq.peek_delta() {
-            let (_tool_use_still_possible, tool_use_is_done) =
-                t.prefix_could_be_tool(d.as_str())?;
+    if let Ok(Some(d)) = seq.peek_delta() {
+        if let Some(ref mut state) = seq.tool_call_state {
+            let (_tool_use_still_possible, tool_use_is_done) = state.prefix_status(d.as_str())?;
 
-            if tool_use_is_done
-                && matches!(parse_text_tools(d, seq.tools.clone()), Ok((None, _tools)))
-            {
-                seq.set_state(SequenceState::Done(StopReason::Eos));
-                is_done = Some(StopReason::Eos);
+            if tool_use_is_done {
+                if let Ok(tools) = state.complete_if_tool_call(d.as_str()) {
+                    if !tools.is_empty() {
+                        seq.set_state(SequenceState::Done(StopReason::Eos));
+                        is_done = Some(StopReason::Eos);
+                    }
+                }
             }
         }
     };
@@ -90,32 +138,15 @@ pub(crate) async fn finish_or_add_toks_to_seq(
     // When a tool call prefix is detected and no grammar is already active,
     // build a format-specific grammar and activate it so subsequent tokens
     // are constrained to valid tool call syntax.
-    // For Harmony mode, tool calls are signaled by token-level markers (not
-    // text prefixes), so we also check HarmonyContext for new tool calls.
-    //
-    // Skip when the sequence is already done — peek_delta() still contains
+    // Skip when the sequence is already done: peek_delta() still contains
     // the tool call prefix from earlier generation, which would spuriously
     // re-activate the grammar on a completed sequence.
     if matches!(seq.recognizer, SequenceRecognizer::None) && is_done.is_none() {
-        // Try text-based detection first, then Harmony token-based detection.
-        let grm = if let Some(ref t) = seq.tools {
-            seq.peek_delta()
-                .ok()
-                .flatten()
-                .and_then(|text| t.build_tool_call_grammar(text.as_str()))
-        } else {
-            None
-        };
-        let grm = grm.or_else(|| {
-            if seq.needs_harmony_tool_grammar() {
-                let recipient = seq.harmony_current_tool_recipient();
-                seq.tools
-                    .as_ref()?
-                    .build_harmony_tool_grammar(recipient.as_deref())
-            } else {
-                None
-            }
-        });
+        let text = seq.peek_delta().ok().flatten();
+        let grm = seq
+            .tool_call_state
+            .as_mut()
+            .and_then(|state| state.maybe_activate_continuation_grammar(text.as_deref()));
 
         if let Some(grm) = grm {
             if let Some(ref factory) = metadata.llg_factory {
@@ -123,7 +154,9 @@ pub(crate) async fn finish_or_add_toks_to_seq(
                     Ok(matcher) => {
                         tracing::debug!("Activated tool call grammar");
                         seq.recognizer = SequenceRecognizer::Llguidance(Box::new(matcher));
-                        seq.set_tool_grammar_active(true);
+                        if let Some(state) = seq.tool_call_state.as_mut() {
+                            state.mark_grammar_active(false);
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -140,9 +173,9 @@ pub(crate) async fn finish_or_add_toks_to_seq(
     if seq.get_mut_group().is_streaming {
         let mut tool_use_still_possible = false;
         let mut tool_use_is_done = false;
-        if let Some(ref t) = seq.tools {
-            if let Ok(Some(ref d)) = seq.peek_delta() {
-                (tool_use_still_possible, tool_use_is_done) = t.prefix_could_be_tool(d.as_str())?;
+        if let Ok(Some(d)) = seq.peek_delta() {
+            if let Some(ref state) = seq.tool_call_state {
+                (tool_use_still_possible, tool_use_is_done) = state.prefix_status(d.as_str())?;
             }
         };
 
@@ -151,13 +184,14 @@ pub(crate) async fn finish_or_add_toks_to_seq(
         // 2. Tool call is complete (tool_use_is_done) - send the tool call
         // 3. Sequence is done (is_done.is_some()) - send buffered output as text since it wasn't a valid tool call
         if !tool_use_still_possible || tool_use_is_done || is_done.is_some() {
-            if is_done.is_some() && seq.reasoning_mode().is_some() {
+            if is_done.is_some() && seq.has_reasoning_state() {
                 seq.finalize_reasoning();
             }
             let delta_result = seq.get_delta();
             if let Some(delta) = crate::handle_seq_error_stateaware_ok!(delta_result, seq) {
                 if seq.get_mut_group().is_chat {
-                    let has_reasoning_parser = seq.reasoning_mode().is_some();
+                    let has_external_reasoning_parser = seq.reasoning_mode().is_some();
+                    let has_reasoning_parser = seq.has_reasoning_state();
                     let reasoning_delta = if has_reasoning_parser {
                         seq.get_reasoning_content_delta()
                     } else {
@@ -169,42 +203,22 @@ pub(crate) async fn finish_or_add_toks_to_seq(
                         None
                     };
 
-                    let tool_calls = if seq.is_harmony_mode() {
-                        // In Harmony mode, only finalize tool calls when the sequence is done
-                        // (EOS token or stop string), not when we first detect a tool call.
-                        // This ensures tool call arguments are fully generated.
-                        if is_done.is_some() && seq.has_harmony_tool_calls() {
-                            // Sequence is done and has tool calls - finalize and send them
-                            is_done = Some(StopReason::ToolCalls);
-                            let harmony_tool_calls = seq.get_harmony_tool_calls();
-                            harmony_tool_calls
-                                .into_iter()
-                                .enumerate()
-                                .map(|(i, tc)| ToolCallResponse {
-                                    index: i,
-                                    id: tc.id,
-                                    tp: ToolCallType::Function,
-                                    function: CalledFunction {
-                                        name: tc.name,
-                                        arguments: tc.arguments,
-                                    },
-                                })
-                                .collect()
-                        } else {
-                            vec![]
-                        }
-                    } else {
-                        let (text_new, tool_calls) = parse_streaming_text_and_tool_calls(
+                    let tool_calls = if let Some(state) = seq.tool_call_state.as_mut() {
+                        let parsed = state.parse_streaming(
                             content_delta.take(),
                             delta.as_str(),
-                            has_reasoning_parser,
-                            seq.tools.clone(),
+                            has_external_reasoning_parser,
+                            is_done.is_some(),
                         )?;
-                        content_delta = text_new;
-                        if !tool_calls.is_empty() {
+                        content_delta = parsed.content;
+                        let parsed_tool_use_is_done = parsed.tool_use_is_done;
+                        let _parsed_tool_use_still_possible = parsed.tool_use_still_possible;
+                        if parsed_tool_use_is_done || !parsed.tool_calls.is_empty() {
                             is_done = Some(StopReason::ToolCalls);
                         }
-                        tool_calls
+                        parsed.tool_calls
+                    } else {
+                        Vec::new()
                     };
 
                     seq.add_streaming_chunk_choice_to_group(crate::ChunkChoice {
@@ -328,7 +342,7 @@ pub(crate) async fn finish_or_add_toks_to_seq(
                 None
             };
 
-            // Signal EOS to all reasoning parsers
+            // Signal EOS to parsers before final response assembly.
             seq.finalize_reasoning();
 
             let text = match reason {
@@ -356,39 +370,31 @@ pub(crate) async fn finish_or_add_toks_to_seq(
             };
 
             if seq.get_mut_group().is_chat {
-                let (text_new, tool_calls, reasoning_content) =
-                    if let Some(mode) = seq.reasoning_mode() {
-                        let final_content = seq.get_response_content();
-                        let reasoning = seq.get_reasoning_content();
-
-                        if mode == crate::reasoning_parsers::ReasoningMode::Harmony {
-                            let harmony_tool_calls = seq.get_harmony_tool_calls();
-                            let tool_calls = harmony_tool_calls
-                                .into_iter()
-                                .enumerate()
-                                .map(|(i, tc)| ToolCallResponse {
-                                    index: i,
-                                    id: tc.id,
-                                    tp: ToolCallType::Function,
-                                    function: CalledFunction {
-                                        name: tc.name,
-                                        arguments: tc.arguments,
-                                    },
-                                })
-                                .collect();
-                            (final_content, tool_calls, reasoning)
-                        } else if let Some(content) = final_content {
-                            let (text_new, tool_calls) =
-                                parse_text_and_tool_calls(content.as_str(), seq.tools.clone())?;
-                            (text_new, tool_calls, reasoning)
-                        } else {
-                            (None, vec![], reasoning)
-                        }
-                    } else {
-                        let (text_new, tool_calls) =
-                            parse_text_and_tool_calls(text.as_str(), seq.tools.clone())?;
-                        (text_new, tool_calls, None)
-                    };
+                let has_reasoning_state = seq.has_reasoning_state();
+                let parsed_content = if has_reasoning_state {
+                    seq.get_response_content()
+                } else {
+                    None
+                };
+                let reasoning_content = if has_reasoning_state {
+                    seq.get_reasoning_content()
+                } else {
+                    None
+                };
+                let parsed = if let Some(state) = seq.tool_call_state.as_mut() {
+                    state.finalize_for_response(text.as_str(), parsed_content, reasoning_content)?
+                } else {
+                    crate::tools::state::ToolCallParse {
+                        content: parsed_content.or_else(|| Some(text.clone())),
+                        reasoning_content,
+                        tool_calls: Vec::new(),
+                        tool_use_still_possible: false,
+                        tool_use_is_done: false,
+                    }
+                };
+                let text_new = parsed.content;
+                let tool_calls = parsed.tool_calls;
+                let reasoning_content = parsed.reasoning_content;
 
                 if !tool_calls.is_empty() {
                     reason = StopReason::ToolCalls;
@@ -533,6 +539,14 @@ pub async fn sample_and_add_toks(
     debug_assert_eq!(logits_seq.len(), seqs_len);
 
     let use_async_pool = seqs_len > 1;
+    let metadata = this.get_metadata();
+    let llg_factory = metadata.llg_factory.clone();
+    let max_model_len = metadata.max_seq_len;
+    let eos_toks = if disable_eos_stop {
+        None
+    } else {
+        Some(metadata.eos_tok.clone())
+    };
 
     let sampling_futures: Vec<_> = std::iter::zip(logits_seq, seqs.iter_mut())
         .map(|(logits_per_seq, seq)| {
@@ -541,6 +555,9 @@ pub async fn sample_and_add_toks(
                 logits_per_seq,
                 seq,
                 return_logprobs,
+                eos_toks.as_deref(),
+                llg_factory.clone(),
+                max_model_len,
                 rng.clone(),
                 use_async_pool,
                 false,
@@ -572,11 +589,16 @@ pub async fn sample_sequence(
     logits: Tensor,
     seq: &mut Sequence,
     return_logprobs: bool,
+    eos_tok: Option<&[u32]>,
+    llg_factory: Option<Arc<llguidance::ParserFactory>>,
+    max_model_len: usize,
     rng: Arc<std::sync::Mutex<Isaac64Rng>>,
     use_async_pool: bool,
     sample_speculative: bool,
     multiple_sequences: bool,
 ) -> Result<Logprobs> {
+    activate_required_tool_call_grammar(seq, llg_factory.as_ref(), max_model_len, false);
+
     let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
 
     let sampler = seq.sampler();
@@ -606,6 +628,13 @@ pub async fn sample_sequence(
         )?
     };
 
+    let stop_token_requires_tool = seq.tool_call_state.as_ref().is_some_and(|state| {
+        state.is_stop_token_blocked(first_lobprobs_response.token, eos_tok, seq.stop_tokens())
+    });
+    if stop_token_requires_tool {
+        activate_required_tool_call_grammar(seq, llg_factory.as_ref(), max_model_len, true);
+    }
+
     let bias_if_not_allowed = match &mut seq.recognizer {
         SequenceRecognizer::Llguidance(ref mut llg) => {
             if !llg.is_stopped()
@@ -613,6 +642,7 @@ pub async fn sample_sequence(
                     .validate_tokens(&[first_lobprobs_response.token])
                     .unwrap_or(0)
                     == 1
+                && !stop_token_requires_tool
             {
                 None
             } else {
@@ -677,15 +707,14 @@ pub async fn sample_sequence(
         SequenceRecognizer::None => {}
     }
 
-    // Deactivate mid-stream tool grammar when the grammar has completed
-    // (i.e. the full tool call body and closing delimiter have been
-    // generated).  This allows re-activation for subsequent tool calls
-    // in multi-tool-call turns.
     if let SequenceRecognizer::Llguidance(ref llg) = seq.recognizer {
-        if llg.is_stopped() && seq.is_tool_grammar_active() {
-            seq.recognizer = SequenceRecognizer::None;
-            seq.set_tool_grammar_active(false);
-            tracing::debug!("Deactivated tool call grammar (body complete)");
+        if llg.is_stopped() {
+            if let Some(state) = seq.tool_call_state.as_mut() {
+                if state.clear_active_grammar() {
+                    seq.recognizer = SequenceRecognizer::None;
+                    tracing::debug!("Deactivated tool call grammar (body complete)");
+                }
+            }
         }
     }
 
@@ -694,12 +723,10 @@ pub async fn sample_sequence(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use mistralrs_mcp::{Function, Tool, ToolType};
 
     use super::*;
-    use crate::tools::{ToolCallingMatcher, ToolChoice};
+    use crate::tools::{ToolCallState, ToolChoice};
 
     fn weather_tool() -> Tool {
         Tool {
@@ -716,10 +743,10 @@ mod tests {
     #[test]
     fn gemma4_tool_call_suppresses_raw_content_without_suffix() {
         let tool = weather_tool();
-        let matcher = Arc::new(ToolCallingMatcher::new(ToolChoice::Auto, Some(&[tool])).unwrap());
+        let mut state = ToolCallState::new(ToolChoice::Auto, Some(&[tool]), None).unwrap();
         let raw = r#"<|tool_call>call:get_weather{city:<|"|>Paris<|"|>}"#;
 
-        let (content, tool_calls) = parse_text_and_tool_calls(raw, Some(matcher)).unwrap();
+        let (content, tool_calls) = parse_text_and_tool_calls(raw, Some(&mut state)).unwrap();
 
         assert_eq!(content, None);
         assert_eq!(tool_calls.len(), 1);
@@ -728,13 +755,27 @@ mod tests {
     }
 
     #[test]
+    fn canonical_tool_call_preserves_text_before_call() {
+        let tool = weather_tool();
+        let mut state = ToolCallState::new(ToolChoice::Auto, Some(&[tool]), None).unwrap();
+        let raw = r#"I'll check that.<tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>"#;
+
+        let (content, tool_calls) = parse_text_and_tool_calls(raw, Some(&mut state)).unwrap();
+
+        assert_eq!(content, Some("I'll check that.".to_string()));
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].function.name, "get_weather");
+        assert_eq!(tool_calls[0].function.arguments, r#"{"city":"Paris"}"#);
+    }
+
+    #[test]
     fn reasoning_stream_does_not_fallback_to_raw_delta() {
         let tool = weather_tool();
-        let matcher = Arc::new(ToolCallingMatcher::new(ToolChoice::Auto, Some(&[tool])).unwrap());
+        let mut state = ToolCallState::new(ToolChoice::Auto, Some(&[tool]), None).unwrap();
         let raw = r#"<|tool_call>call:get_weather{city:<|"|>Paris<|"|>}"#;
 
         let (content, tool_calls) =
-            parse_streaming_text_and_tool_calls(None, raw, true, Some(matcher)).unwrap();
+            parse_streaming_text_and_tool_calls(None, raw, true, Some(&mut state)).unwrap();
 
         assert_eq!(content, None);
         assert!(tool_calls.is_empty());
@@ -743,11 +784,11 @@ mod tests {
     #[test]
     fn non_reasoning_stream_uses_raw_delta() {
         let tool = weather_tool();
-        let matcher = Arc::new(ToolCallingMatcher::new(ToolChoice::Auto, Some(&[tool])).unwrap());
+        let mut state = ToolCallState::new(ToolChoice::Auto, Some(&[tool]), None).unwrap();
         let raw = r#"<|tool_call>call:get_weather{city:<|"|>Paris<|"|>}"#;
 
         let (content, tool_calls) =
-            parse_streaming_text_and_tool_calls(None, raw, false, Some(matcher)).unwrap();
+            parse_streaming_text_and_tool_calls(None, raw, false, Some(&mut state)).unwrap();
 
         assert_eq!(content, None);
         assert_eq!(tool_calls.len(), 1);

@@ -1,7 +1,9 @@
 use std::sync::{atomic::AtomicUsize, Arc};
 
 use candle_core::{DType, Device, Result, Tensor};
+use safetensors::tensor::Dtype;
 
+use crate::uqff::{UqffHeaderMatch, UqffLayerHeaderView};
 use crate::{
     IsqType, QuantMethod, QuantMethodConfig, QuantizeOntoGuard, QuantizedConfig, QuantizedSerde,
     QuantizedSerdeType, Shard, ShardedVarBuilder, UqffReader, UqffTensor,
@@ -82,6 +84,50 @@ pub struct AfqLayer {
     bits: AfqBits,
     group_size: AfqGroupSize,
     stats: crate::ImatrixLayerStats,
+}
+
+impl AfqLayer {
+    pub(crate) fn inspect_uqff_header(layer: &UqffLayerHeaderView<'_>) -> Option<UqffHeaderMatch> {
+        const WEIGHT_SUFFIXES: &[&str] = &[
+            "weight",
+            "weight.format",
+            "weight.bits",
+            "weight.group_size",
+            "weight.scales",
+            "weight.biases",
+        ];
+        if layer.exact_weight_suffixes(WEIGHT_SUFFIXES)
+            && layer.scalar("weight.format", Dtype::U8)
+            && layer.scalar("weight.bits", Dtype::U8)
+            && layer.scalar("weight.group_size", Dtype::U8)
+        {
+            Some(UqffHeaderMatch {
+                serde_type: QuantizedSerdeType::Afq,
+            })
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn stored_label_from_uqff_tensors(
+        tensors: &[UqffTensor],
+        prefix: &str,
+    ) -> Result<String> {
+        let bits = crate::uqff::u8_scalar_with_suffix(tensors, prefix, "weight.bits")?;
+        Ok(afq_bits_label(bits))
+    }
+}
+
+fn afq_bits_label(bits: u8) -> String {
+    match bits {
+        2 => "afq2",
+        3 => "afq3",
+        4 => "afq4",
+        6 => "afq6",
+        8 => "afq8",
+        _ => "afq",
+    }
+    .to_string()
 }
 
 /// Cheap handle to an AfqLayer's storage tensors, used by fused QKV/gate-up paths.
@@ -279,12 +325,7 @@ impl AfqLayer {
         }
     }
 
-    fn from_uqff_direct(
-        reader: &UqffReader,
-        key: &str,
-        device: &Device,
-        shard: Shard,
-    ) -> Result<Self> {
+    fn from_uqff(reader: &UqffReader, key: &str, device: &Device, shard: Shard) -> Result<Self> {
         let bits = AfqBits::try_from(reader.load_u8_scalar(&format!("{key}.weight.bits"))?)?;
         let group_size =
             AfqGroupSize::try_from(reader.load_u8_scalar(&format!("{key}.weight.group_size"))?)?;
@@ -421,7 +462,7 @@ impl QuantizedSerde for AfqLayer {
     fn isq_serde_supported(&self) -> bool {
         true
     }
-    fn serialize_directly(&self, prefix: &str, ty: IsqType) -> Result<Vec<UqffTensor>> {
+    fn serialize_uqff(&self, prefix: &str, ty: IsqType) -> Result<Vec<UqffTensor>> {
         let actual_ty = match self.bits {
             AfqBits::Two => IsqType::AFQ2,
             AfqBits::Three => IsqType::AFQ3,
@@ -453,17 +494,15 @@ impl QuantizedSerde for AfqLayer {
         }
         Ok(data)
     }
-    fn deserialize_directly(
+    fn deserialize_uqff(
         reader: &UqffReader,
         prefix: &str,
         device: &Device,
         shard: Shard,
     ) -> Result<Arc<dyn QuantMethod>> {
-        Ok(Arc::new(Self::from_uqff_direct(
-            reader, prefix, device, shard,
-        )?))
+        Ok(Arc::new(Self::from_uqff(reader, prefix, device, shard)?))
     }
-    fn isq_type_from_uqff_direct(reader: &UqffReader, prefix: &str) -> Result<IsqType> {
+    fn isq_type_from_uqff(reader: &UqffReader, prefix: &str) -> Result<IsqType> {
         match AfqBits::try_from(reader.load_u8_scalar(&format!("{prefix}.weight.bits"))? as usize)?
         {
             AfqBits::Two => Ok(IsqType::AFQ2),

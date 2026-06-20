@@ -35,6 +35,7 @@ pub const MISTRALRS_GIT_REVISION: &str = match option_env!("MISTRALRS_GIT_REVISI
     Some(value) => value,
     None => "unknown",
 };
+pub const MISTRALRS_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 mod cuda;
 mod device_map;
@@ -120,14 +121,17 @@ pub use mistralrs_mcp::{
 pub use mistralrs_quant::{IsqBits, IsqType, MULTI_LORA_DELIMITER};
 pub use mistralrs_sandbox::{NetworkMode, SandboxPolicy};
 
+pub const DEFAULT_CODE_EXEC_TIMEOUT_SECS: u64 = 60;
+pub const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 600;
+
 /// Python code execution config.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct CodeExecutionConfig {
     /// Defaults to `python3` (`python` on Windows).
     #[serde(default = "default_python_path")]
     pub python_path: std::path::PathBuf,
-    /// Per-execution timeout. Defaults to 30s.
-    #[serde(default = "default_timeout_secs")]
+    /// Per-execution timeout. Defaults to 60s.
+    #[serde(default = "default_code_exec_timeout_secs")]
     pub timeout_secs: u64,
     /// If `None`, a temp dir is created. Otherwise this is the cwd for the model's code.
     #[serde(default)]
@@ -254,15 +258,19 @@ fn default_python_path() -> std::path::PathBuf {
         std::path::PathBuf::from("python3")
     }
 }
-fn default_timeout_secs() -> u64 {
-    30
+fn default_code_exec_timeout_secs() -> u64 {
+    DEFAULT_CODE_EXEC_TIMEOUT_SECS
+}
+
+fn default_shell_timeout_secs() -> u64 {
+    DEFAULT_SHELL_TIMEOUT_SECS
 }
 
 impl Default for CodeExecutionConfig {
     fn default() -> Self {
         Self {
             python_path: default_python_path(),
-            timeout_secs: default_timeout_secs(),
+            timeout_secs: default_code_exec_timeout_secs(),
             working_directory: None,
             sandbox_policy: None,
             permission: CodeExecutionPermission::Auto,
@@ -276,7 +284,7 @@ impl Default for CodeExecutionConfig {
 pub struct ShellConfig {
     #[serde(default = "default_shell_path")]
     pub shell_path: std::path::PathBuf,
-    #[serde(default = "default_timeout_secs")]
+    #[serde(default = "default_shell_timeout_secs")]
     pub timeout_secs: u64,
     #[serde(default)]
     pub working_directory: Option<std::path::PathBuf>,
@@ -310,7 +318,7 @@ impl Default for ShellConfig {
     fn default() -> Self {
         Self {
             shell_path: default_shell_path(),
-            timeout_secs: default_timeout_secs(),
+            timeout_secs: default_shell_timeout_secs(),
             working_directory: None,
             sandbox_policy: None,
             permission: AgentPermission::Auto,
@@ -324,13 +332,14 @@ pub use files::{
 };
 pub use paged_attention::{MemoryGpuConfig, PagedAttentionConfig, PagedCacheType};
 pub use pipeline::hf::{
-    hf_home_dir, hf_hub_cache_dir, hf_token_path, is_hf_hub_offline, probe_hf_repo_files,
+    get_model_file, hf_home_dir, hf_hub_cache_dir, hf_token_path, is_hf_hub_offline,
+    list_model_files, probe_hf_repo_files, read_model_file_range, try_get_model_file,
     HF_HUB_OFFLINE_ENV,
 };
 pub use pipeline::{
-    chat_template::ChatTemplate, expand_isq_value, parse_isq_value, parse_uqff_shard,
-    resolve_uqff_shorthand, AdapterPaths, AnyMoeLoader, AnyMoePipeline, AutoDeviceMapParams,
-    AutoLoader, AutoLoaderBuilder, DiffusionGenerationParams, DiffusionLoader,
+    chat_template::ChatTemplate, expand_isq_value, expand_uqff_shards, parse_isq_value,
+    parse_uqff_shard, resolve_uqff_shorthand, AdapterPaths, AnyMoeLoader, AnyMoePipeline,
+    AutoDeviceMapParams, AutoLoader, AutoLoaderBuilder, DiffusionGenerationParams, DiffusionLoader,
     DiffusionLoaderBuilder, DiffusionLoaderType, EmbeddingLoader, EmbeddingLoaderBuilder,
     EmbeddingLoaderType, EmbeddingModelPaths, EmbeddingSpecificConfig, GGMLLoader,
     GGMLLoaderBuilder, GGMLSpecificConfig, GGUFLoader, GGUFLoaderBuilder, GGUFSpecificConfig,
@@ -362,7 +371,9 @@ pub use speech_models::{utils as speech_utils, SpeechGenerationConfig, SpeechLoa
 use tokio::runtime::Runtime;
 use toml_selector::{TomlLoaderArgs, TomlSelector};
 pub use tools::{
-    NamedFunctionToolChoice, ToolCallResponse, ToolCallType, ToolCallbacks, ToolChoice,
+    AllowedToolChoice, AllowedToolsMode, AllowedToolsToolChoice, AllowedToolsToolChoiceType,
+    BuiltinToolChoice, BuiltinToolChoiceType, NamedFunctionToolChoice, ToolCallResponse,
+    ToolCallType, ToolCallbacks, ToolChoice,
 };
 pub use topology::{LayerTopology, Topology};
 pub use utils::debug::{
@@ -1199,6 +1210,7 @@ impl MistralRs {
     }
 
     async fn new(config: MistralRsBuilder) -> Arc<Self> {
+        info!("mistral.rs version: {MISTRALRS_VERSION}");
         info!("git revision: {MISTRALRS_GIT_REVISION}");
         let MistralRsBuilder {
             pipeline,

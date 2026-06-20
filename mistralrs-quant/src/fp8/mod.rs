@@ -3,9 +3,11 @@ use std::sync::{atomic::AtomicUsize, Arc};
 use candle_core::{DType, Device, Result, Tensor, D};
 use candle_nn::{Linear, Module};
 use quantize::QuantizationResult;
+use safetensors::tensor::Dtype;
 
 mod quantize;
 
+use crate::uqff::{UqffHeaderMatch, UqffLayerHeaderView};
 use crate::{
     cublaslt::{maybe_init_cublas_lt_wrapper, CUBLASLT_CONTROLLER},
     utils::{dtype_to_uqff_code, uqff_code_to_dtype},
@@ -24,6 +26,34 @@ pub struct FP8Linear {
 }
 
 impl FP8Linear {
+    pub(crate) fn inspect_uqff_header(layer: &UqffLayerHeaderView<'_>) -> Option<UqffHeaderMatch> {
+        const WEIGHT_SUFFIXES: &[&str] = &[
+            "weight",
+            "weight.format",
+            "weight.dequant_w_scale",
+            "weight.dequant_x_scale",
+            "weight.quant_scale",
+            "weight.dtype",
+        ];
+        if layer.exact_weight_suffixes(WEIGHT_SUFFIXES)
+            && layer.scalar("weight.format", Dtype::U8)
+            && layer.scalar("weight.dtype", Dtype::U32)
+        {
+            Some(UqffHeaderMatch {
+                serde_type: QuantizedSerdeType::Fp8,
+            })
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn stored_label_from_uqff_tensors(
+        _tensors: &[UqffTensor],
+        _prefix: &str,
+    ) -> Result<String> {
+        Ok("fp8".to_string())
+    }
+
     pub fn from_parts(
         weight: Tensor,
         bias: Option<Tensor>,
@@ -41,12 +71,7 @@ impl FP8Linear {
         }
     }
 
-    fn from_uqff_direct(
-        reader: &UqffReader,
-        key: &str,
-        device: &Device,
-        shard: Shard,
-    ) -> Result<Self> {
+    fn from_uqff(reader: &UqffReader, key: &str, device: &Device, shard: Shard) -> Result<Self> {
         let dims = reader.tensor_dims(&format!("{key}.weight"))?;
         let range = crate::uqff::shard_range(shard, &dims)?;
         let weight = reader.load_tensor_sharded(&format!("{key}.weight"), device, range)?;
@@ -214,7 +239,7 @@ impl QuantizedSerde for FP8Linear {
     fn name(&self) -> &'static str {
         "fp8-linear"
     }
-    fn serialize_directly(&self, prefix: &str, ty: IsqType) -> Result<Vec<UqffTensor>> {
+    fn serialize_uqff(&self, prefix: &str, ty: IsqType) -> Result<Vec<UqffTensor>> {
         if ty != IsqType::F8E4M3 {
             candle_core::bail!("Cannot serialize FP8 layer as {ty}; actual type is F8E4M3.");
         }
@@ -244,17 +269,15 @@ impl QuantizedSerde for FP8Linear {
         }
         Ok(data)
     }
-    fn deserialize_directly(
+    fn deserialize_uqff(
         reader: &UqffReader,
         prefix: &str,
         device: &Device,
         shard: Shard,
     ) -> Result<Arc<dyn QuantMethod>> {
-        Ok(Arc::new(Self::from_uqff_direct(
-            reader, prefix, device, shard,
-        )?))
+        Ok(Arc::new(Self::from_uqff(reader, prefix, device, shard)?))
     }
-    fn isq_type_from_uqff_direct(_reader: &UqffReader, _prefix: &str) -> Result<IsqType> {
+    fn isq_type_from_uqff(_reader: &UqffReader, _prefix: &str) -> Result<IsqType> {
         Ok(IsqType::F8E4M3)
     }
 }
