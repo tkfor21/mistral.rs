@@ -18,7 +18,7 @@ on:
       ref:
         description: "Git ref (branch or commit) to build."
         required: true
-        default: "main"
+        default: "master"
       dry_run:
         description: "Build + smoke-test only; upload nothing."
         type: boolean
@@ -34,6 +34,11 @@ concurrency:
 env:
   CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: always
+  # Suppress .cargo/config.toml's target-cpu=native (same as upstream ci.yml):
+  # ring asserts baseline aes/sha2 on aarch64-apple-darwin, and native inside
+  # the runner VMs drops them. Empty RUSTFLAGS -> rustc's apple-m1 default
+  # baseline, which is also the right portable target for a distributed binary.
+  RUSTFLAGS: ""
 
 jobs:
   build:
