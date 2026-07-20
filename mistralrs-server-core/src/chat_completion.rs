@@ -47,8 +47,11 @@ use crate::{
     skills::SkillStore,
     streaming::{base_create_streamer, get_keep_alive_interval, BaseStreamer, DoneState},
     types::{ExtractedMistralRsState, OnChunkCallback, OnDoneCallback, SharedMistralRsState},
-    util::{parse_audio_url, parse_image_url, sanitize_error_message, validate_model_name},
-    video::parse_video_url,
+    util::{
+        parse_audio_url_for_server, parse_image_url_for_server, sanitize_error_message,
+        validate_model_name,
+    },
+    video::parse_video_url_for_server,
 };
 
 /// A callback function that processes streaming response chunks before they are sent to the client.
@@ -928,7 +931,7 @@ pub async fn parse_request(
                 // Parse images
                 let mut images = Vec::new();
                 for url_unparsed in image_urls {
-                    let image = parse_image_url(&url_unparsed)
+                    let image = parse_image_url_for_server(&url_unparsed)
                         .await
                         .context(format!("Failed to parse image resource: {url_unparsed}"))?;
                     images.push(image);
@@ -937,7 +940,7 @@ pub async fn parse_request(
                 // Parse audios
                 let mut audios = Vec::new();
                 for url_unparsed in audio_urls {
-                    let audio = parse_audio_url(&url_unparsed)
+                    let audio = parse_audio_url_for_server(&url_unparsed)
                         .await
                         .context(format!("Failed to parse audio resource: {url_unparsed}"))?;
                     audios.push(audio);
@@ -946,7 +949,7 @@ pub async fn parse_request(
                 // Parse videos
                 let mut videos = Vec::new();
                 for url_unparsed in video_urls {
-                    let video = parse_video_url(&url_unparsed, None)
+                    let video = parse_video_url_for_server(&url_unparsed, None)
                         .await
                         .context(format!("Failed to parse video resource: {url_unparsed}"))?;
                     videos.push(video);
@@ -990,6 +993,10 @@ pub async fn parse_request(
         oairequest.dry_allowed_length,
     )?;
 
+    if oairequest.max_tokens == Some(0) {
+        anyhow::bail!("max_tokens must be at least 1.");
+    }
+
     let is_streaming = oairequest.stream.unwrap_or(false);
 
     if oairequest.grammar.is_some() && oairequest.response_format.is_some() {
@@ -1005,6 +1012,7 @@ pub async fn parse_request(
             Some(ResponseFormat::JsonSchema {
                 json_schema: JsonSchemaResponseFormat { name: _, schema },
             }) => Constraint::JsonSchema(schema),
+            Some(ResponseFormat::JsonObject) => Constraint::JsonSchema(json!({"type": "object"})),
             Some(ResponseFormat::Text) => Constraint::None,
             None => Constraint::None,
         },

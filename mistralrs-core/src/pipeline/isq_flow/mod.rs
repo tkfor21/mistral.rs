@@ -13,7 +13,7 @@ pub(crate) use drive::{
 };
 pub use online::CalibrationStatus;
 pub(crate) use online::{apply_calibration, begin_calibration, calibration_status};
-pub(crate) use plan::{resolve_and_install_isq_plan, IsqPlanInputs};
+pub(crate) use plan::{resolve_and_install_isq_plan, resolve_weight_load_dtype, IsqPlanInputs};
 
 use std::collections::HashMap;
 
@@ -30,16 +30,17 @@ pub(crate) fn requantize_and_swap(
     let handles = mistralrs_quant::requantize_tracked(
         modules,
         pool_ty,
-        mistralrs_quant::RequantizeResults::Resident,
         ty_for,
         imatrix_for,
+        mistralrs_quant::IsqConsumer::RuntimeSwap,
+        0,
         None,
     )?;
     // drain everything; failed layers keep their prior resident, so a partial swap stays consistent
     let mut errors: Vec<String> = Vec::new();
     for (module, rx) in modules.iter().zip(handles.receivers) {
         match rx.recv() {
-            Ok(Ok(layer)) => module.ct.replace(layer),
+            Ok(Ok(output)) => module.ct.replace(output.value),
             Ok(Err(e)) => errors.push(format!("{}: {e}", module.key)),
             Err(e) => errors.push(format!("{}: channel error: {e}", module.key)),
         }

@@ -1089,7 +1089,7 @@ impl NonZero {
     }
 }
 
-#[cfg(all(feature = "cuda", not(feature = "cuda-13000")))]
+#[cfg(all(feature = "cuda", not(cuda_ge_13000)))]
 mod cuda_ops_cccl2 {
     use super::*;
 
@@ -1161,7 +1161,7 @@ mod cuda_ops_cccl2 {
     }
 }
 
-#[cfg(all(feature = "cuda", feature = "cuda-13000"))]
+#[cfg(all(feature = "cuda", cuda_ge_13000))]
 mod cuda_ops_cccl3 {
     use super::*;
 
@@ -1233,9 +1233,9 @@ mod cuda_ops_cccl3 {
     }
 }
 
-#[cfg(all(feature = "cuda", not(feature = "cuda-13000")))]
+#[cfg(all(feature = "cuda", not(cuda_ge_13000)))]
 use cuda_ops_cccl2::{count_nonzero_cuda, nonzero_cuda};
-#[cfg(all(feature = "cuda", feature = "cuda-13000"))]
+#[cfg(all(feature = "cuda", cuda_ge_13000))]
 use cuda_ops_cccl3::{count_nonzero_cuda, nonzero_cuda};
 
 impl CustomOp1 for NonZero {
@@ -2664,14 +2664,19 @@ impl CustomOp2 for FusedGlu {
                 let a_offset = l1.start_offset();
                 let b_offset = l2.start_offset();
 
-                let result: Vec<f32> = (0..len)
-                    .into_par_iter()
-                    .map(|i| {
-                        let a_val = a_slice[a_offset + i];
-                        let b_val = b_slice[b_offset + i];
-                        apply_cpu_activation(a_val, activation) * b_val
-                    })
-                    .collect();
+                // barrier pool instead of rayon: its workers already own these cores and
+                // would otherwise spin against the rayon threads between matmuls
+                let mut result = vec![0f32; len];
+                let a = &a_slice[a_offset..a_offset + len];
+                let b = &b_slice[b_offset..b_offset + len];
+                let out_ptr = result.as_mut_ptr() as usize;
+                candle_core::utils::barrier_pool().execute_chunked(len, |range| {
+                    let out = out_ptr as *mut f32;
+                    for i in range {
+                        let v = apply_cpu_activation(a[i], activation) * b[i];
+                        unsafe { *out.add(i) = v };
+                    }
+                });
                 CpuStorage::F32(result)
             }
             DType::F16 => {
@@ -2680,16 +2685,20 @@ impl CustomOp2 for FusedGlu {
                 let a_offset = l1.start_offset();
                 let b_offset = l2.start_offset();
 
-                let result: Vec<f16> = (0..len)
-                    .into_par_iter()
-                    .map(|i| {
-                        let a_val = a_slice[a_offset + i].to_f32();
-                        // Cast activation back to f16 before multiplying, matching candle's
-                        // two-step behavior: unary op in f32 -> cast to f16 -> binary mul
-                        let activated = f16::from_f32(apply_cpu_activation(a_val, activation));
-                        f16::from_f32(activated.to_f32() * b_slice[b_offset + i].to_f32())
-                    })
-                    .collect();
+                let mut result = vec![f16::ZERO; len];
+                let a = &a_slice[a_offset..a_offset + len];
+                let b = &b_slice[b_offset..b_offset + len];
+                let out_ptr = result.as_mut_ptr() as usize;
+                candle_core::utils::barrier_pool().execute_chunked(len, |range| {
+                    let out = out_ptr as *mut f16;
+                    for i in range {
+                        // unary in f32 -> cast to f16 -> mul, matching candle's two-step behavior
+                        let activated =
+                            f16::from_f32(apply_cpu_activation(a[i].to_f32(), activation));
+                        let v = f16::from_f32(activated.to_f32() * b[i].to_f32());
+                        unsafe { *out.add(i) = v };
+                    }
+                });
                 CpuStorage::F16(result)
             }
             DType::BF16 => {
@@ -2698,16 +2707,20 @@ impl CustomOp2 for FusedGlu {
                 let a_offset = l1.start_offset();
                 let b_offset = l2.start_offset();
 
-                let result: Vec<bf16> = (0..len)
-                    .into_par_iter()
-                    .map(|i| {
-                        let a_val = a_slice[a_offset + i].to_f32();
-                        // Cast activation back to bf16 before multiplying, matching candle's
-                        // two-step behavior: unary op in f32 -> cast to bf16 -> binary mul
-                        let activated = bf16::from_f32(apply_cpu_activation(a_val, activation));
-                        bf16::from_f32(activated.to_f32() * b_slice[b_offset + i].to_f32())
-                    })
-                    .collect();
+                let mut result = vec![bf16::ZERO; len];
+                let a = &a_slice[a_offset..a_offset + len];
+                let b = &b_slice[b_offset..b_offset + len];
+                let out_ptr = result.as_mut_ptr() as usize;
+                candle_core::utils::barrier_pool().execute_chunked(len, |range| {
+                    let out = out_ptr as *mut bf16;
+                    for i in range {
+                        // unary in f32 -> cast to bf16 -> mul, matching candle's two-step behavior
+                        let activated =
+                            bf16::from_f32(apply_cpu_activation(a[i].to_f32(), activation));
+                        let v = bf16::from_f32(activated.to_f32() * b[i].to_f32());
+                        unsafe { *out.add(i) = v };
+                    }
+                });
                 CpuStorage::BF16(result)
             }
             other => candle_core::bail!("fused_glu: unsupported dtype {:?}", other),

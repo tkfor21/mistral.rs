@@ -54,9 +54,10 @@ pub use loaders::{
     EmbeddingLoaderType, EmbeddingModel, EmbeddingModelLoader, EmbeddingModelPaths,
     EmbeddingModule, EmbeddingModulePaths, EmbeddingModuleType, FluxLoader, GLM4Loader,
     GLM4MoeLiteLoader, GLM4MoeLoader, Gemma2Loader, Gemma3Loader, Gemma3nLoader, Gemma4Loader,
-    GemmaLoader, GptOssLoader, GraniteMoeHybridLoader, Idefics2Loader, Idefics3Loader, LLaVALoader,
-    LLaVANextLoader, LlamaLoader, Loader, LocalModelPaths, MiniCpmOLoader, Mistral3Loader,
-    MistralLoader, MixtralLoader, ModelKind, ModelPaths, MultimodalLoaderType, MultimodalModel,
+    GemmaLoader, GptOssLoader, GraniteMoeHybridLoader, HunYuanDenseV1Loader, HunYuanMoEV1Loader,
+    Idefics2Loader, Idefics3Loader, LLaVALoader, LLaVANextLoader, Lfm2Loader, Lfm2VlLoader,
+    LlamaLoader, Loader, LocalModelPaths, MiniCpmOLoader, Mistral3Loader, MistralLoader,
+    MixtralLoader, ModelKind, ModelPaths, MultimodalLoaderType, MultimodalModel,
     MultimodalModelLoader, NormalLoaderType, NormalLoadingMetadata, NormalModel, NormalModelLoader,
     Phi2Loader, Phi3Loader, Phi3VLoader, Phi3_5MoELoader, Phi4MMLoader, PrettyName,
     QuantizationKind, Qwen2Loader, Qwen2VLLoader, Qwen2_5VLLoader, Qwen3EmbeddingLoader,
@@ -657,6 +658,8 @@ pub struct GeneralMetadata {
     pub cache_engine: Option<CacheEngine>,
     pub model_metadata: Option<Arc<dyn ModelConfigLike + Send + Sync>>,
     pub modalities: Modalities,
+    // UQFF writes force the whole model onto CPU, so the pipeline is not servable afterwards.
+    pub loaded_for_uqff_write: bool,
 }
 
 impl GeneralMetadata {
@@ -949,11 +952,6 @@ impl ForwardInputsResult {
             Self::BlockGeneration { .. } => Ok(self.clone()),
         }
     }
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-pub(crate) struct FileListCache {
-    files: Vec<String>,
 }
 
 #[async_trait::async_trait]

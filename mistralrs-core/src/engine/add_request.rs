@@ -35,12 +35,14 @@ impl Engine {
                 );
                 let in_agentic_loop =
                     request.max_tool_rounds == agentic_loop::AGENTIC_LOOP_REENTRY_SENTINEL;
-                let has_tooling = !self.tool_callbacks.is_empty()
-                    && request.tools.as_ref().is_some_and(|t| !t.is_empty());
+                let has_tooling = self.tool_callbacks.keys().any(|name| {
+                    agentic_loop::registered_tool_active_for_request(
+                        name,
+                        request.enable_code_execution,
+                        request.enable_shell,
+                    )
+                });
                 let has_search = request.web_search_options.is_some();
-                let has_code_exec =
-                    request.enable_code_execution && !self.tool_callbacks.is_empty();
-                let has_shell = request.enable_shell && !self.tool_callbacks.is_empty();
                 let has_agentic =
                     request.max_tool_rounds.is_some() || request.tool_dispatch_url.is_some();
                 let has_input_files =
@@ -48,12 +50,7 @@ impl Engine {
 
                 if is_chat
                     && !in_agentic_loop
-                    && (has_search
-                        || has_tooling
-                        || has_code_exec
-                        || has_shell
-                        || has_agentic
-                        || has_input_files)
+                    && (has_search || has_tooling || has_agentic || has_input_files)
                 {
                     agentic_loop::agentic_loop(self.clone(), *request).await;
                 } else if request.files.as_ref().is_some_and(|f| !f.is_empty()) {
@@ -119,6 +116,24 @@ impl Engine {
                 ..
             }
         );
+
+        let is_text_generation = matches!(
+            &request.messages,
+            RequestMessage::Chat { .. }
+                | RequestMessage::Completion { .. }
+                | RequestMessage::CompletionTokens(_)
+                | RequestMessage::MultimodalChat { .. }
+        );
+        if is_text_generation && request.sampling_params.max_len == Some(0) {
+            request
+                .response
+                .send(Response::ValidationError(
+                    "max_tokens must be at least 1.".into(),
+                ))
+                .await
+                .unwrap_or_else(|_| warn!("Receiver disconnected"));
+            return;
+        }
 
         let best_of = match request.messages {
             RequestMessage::Completion { best_of, .. } => best_of,
@@ -553,7 +568,14 @@ impl Engine {
                 let n_tokens = prompt_tokens.len();
                 let required_blocks = n_tokens.div_ceil(NormalCache::CACHE_GROW_SIZE);
                 let max_seq_len = required_blocks * NormalCache::CACHE_GROW_SIZE;
-                let dtype = metadata.activation_dtype;
+                let mut dtype = metadata.activation_dtype;
+                // matches the f16 conversion KvCache::append applies on CPU
+                if device.is_cpu()
+                    && dtype == candle_core::DType::F32
+                    && crate::kv_cache::cpu_kv_f16()
+                {
+                    dtype = candle_core::DType::F16;
+                }
                 let mut layer_caches = Vec::with_capacity(model_metadata.num_layers());
                 for layer_idx in 0..model_metadata.num_layers() {
                     if !needs_preallocated_cache
@@ -713,6 +735,16 @@ impl Engine {
                         seq.enable_reasoning(
                             crate::reasoning_parsers::ReasoningMode::TagBased,
                             Box::new(ctx),
+                        );
+                    } else if chat_template.uses_gemma_turns() {
+                        // Gemma-family thinking convention (MedGemma 1.5 etc):
+                        // <unused94>thought\n...<unused95>. Pass-through for models
+                        // that never emit the tokens.
+                        seq.enable_reasoning(
+                            crate::reasoning_parsers::ReasoningMode::TagBased,
+                            Box::new(
+                                crate::reasoning_parsers::TagReasoningContext::new_gemma_thought(),
+                            ),
                         );
                     }
                 }

@@ -33,6 +33,18 @@ For the offline workflow (pre-downloading models, local paths), see [run any mod
 | `MISTRALRS_NO_MMAP` | `MISTRALRS_NO_MMAP=1` loads safetensors without mmap. |
 | `MISTRALRS_ISQ_SINGLETHREAD` | If set, runs [ISQ (in-situ quantization)](/mistral.rs/reference/quantization-types/) single-threaded. |
 
+## CPU runtime
+
+| Variable | Purpose |
+|---|---|
+| `RAYON_NUM_THREADS` | Sets the default CPU worker count used by Candle and Rayon-backed CPU kernels unless a more specific variable is set. |
+| `CANDLE_NUM_THREADS` | Sets Candle's CPU worker count. This overrides the fallback from `RAYON_NUM_THREADS` for Candle's own thread pools. |
+| `CANDLE_CPU_MASK` | Linux only. Pins CPU worker threads to a cpulist such as `15-19` or `5-9,15-19`. If no explicit thread-count variable is set, the mask size also becomes the default worker count. |
+| `CANDLE_CPU_AFFINITY` | Linux only. Set to `1` to try Candle's automatic high-capacity CPU affinity mask on heterogeneous CPUs. Default is off. |
+| `CANDLE_BARRIER_POOL_SPIN_LIMIT` | Advanced CPU tuning. Overrides the spin count used by Candle's persistent barrier pool before worker threads park. |
+
+See [CPU threads and affinity](/mistral.rs/guides/perf/throughput-tuning/#cpu-threads-and-affinity) for examples.
+
 ## Sandbox
 
 | Variable | Purpose |
@@ -85,12 +97,15 @@ These are read by build scripts, not at runtime.
 
 | Variable | Purpose |
 |---|---|
-| `MISTRALRS_METAL_PRECOMPILE` | `MISTRALRS_METAL_PRECOMPILE=0` skips Metal kernel precompilation at build time; kernels are compiled at runtime on first use. |
+| `MISTRALRS_METAL_PRECOMPILE` | `MISTRALRS_METAL_PRECOMPILE=0` skips Metal kernel precompilation at build time; kernels are compiled at runtime on first use. Also accepts `false`, `no`, and `off`. |
+| `MISTRALRS_METAL_PLATFORMS` | Limits which Metal platform metallibs are precompiled. Accepts comma-separated `macos`, `ios`, `tvos`, or `all`; defaults to all platforms. For local macOS development, use `MISTRALRS_METAL_PLATFORMS=macos`. |
 | `CUDA_NVCC_FLAGS` | Extra compiler options passed to CUDA builds. |
-| `MISTRALRS_INSTALL_TAG` | Pins the installers to a specific release tag (e.g. `v0.8.17`): the prebuilt is downloaded from that release, and a source build checks out that git tag. Default is the latest stable release (prebuilt) or latest `master` (source). |
+| `MISTRALRS_CUTLASS_COMMIT` | Overrides the CUTLASS git commit used by CUDA build scripts for flash-attention and CUTLASS MoE kernels. Defaults to the project-pinned commit. |
+| `MISTRALRS_INSTALL_TAG` | Pins the installers to a specific release tag (e.g. `v0.9.0`): the prebuilt is downloaded from that release, and a source build checks out that git tag. Default is the latest stable release (prebuilt) or latest `master` (source). |
 | `MISTRALRS_INSTALL_FROM_SOURCE` | `MISTRALRS_INSTALL_FROM_SOURCE=1` makes the shell and PowerShell installers skip the prebuilt download and build from the latest `master` (bleeding edge) instead of the latest stable release. |
 | `MISTRALRS_INSTALL_NCCL` | `MISTRALRS_INSTALL_NCCL=1` forces the shell and PowerShell installers to add the `nccl` feature for CUDA builds even if NCCL is not detected. |
 | `MISTRALRS_INSTALL_NO_NCCL` | `MISTRALRS_INSTALL_NO_NCCL=1` makes the shell and PowerShell installers skip the `nccl` feature. |
+| `MISTRALRS_INSTALL_ALLOW_CUDA_MISMATCH` | `MISTRALRS_INSTALL_ALLOW_CUDA_MISMATCH=1` lets a source build continue when local `nvcc` is newer than the CUDA version reported by the NVIDIA driver. |
 | `MISTRALRS_INSTALL_YES` | `MISTRALRS_INSTALL_YES=1` auto-confirms every installer prompt (non-interactive installs for CI/containers; used by `mistralrs update`). |
 | `MISTRALRS_INSTALL_IGNORE_FFMPEG` | `MISTRALRS_INSTALL_IGNORE_FFMPEG=1` skips the installer's FFmpeg step, leaving any existing FFmpeg untouched. |
 | `MISTRALRS_GIT_REVISION` | Git revision embedded in the binary by the build script. |

@@ -212,14 +212,14 @@ pub enum Command {
         file: PathBuf,
     },
 
-    /// Update a prebuilt install to the latest release
+    /// Update or migrate an install using the installer
     Update {
-        /// Install a specific release tag instead of the latest (e.g. v0.8.17)
+        /// Install a specific release tag instead of the latest (e.g. v0.9.0)
         #[arg(long)]
         tag: Option<String>,
     },
 
-    /// Remove a prebuilt install
+    /// Remove an installer-managed install
     Uninstall {
         /// Skip the confirmation prompt
         #[arg(short, long)]

@@ -12,12 +12,12 @@ use super::{
 };
 use super::{
     DiffusionGemmaLoader, Gemma3nLoader, Gemma4Loader, Idefics2Loader, Idefics3Loader, LLaVALoader,
-    LLaVANextLoader, Mistral3Loader, MultimodalLoaderType, Phi3VLoader, Qwen2_5VLLoader,
-    VoxtralLoader,
+    LLaVANextLoader, Lfm2VlLoader, Mistral3Loader, MultimodalLoaderType, Phi3VLoader,
+    Qwen2_5VLLoader, VoxtralLoader,
 };
 use crate::attention::ATTENTION_CHUNK_SIZE;
 use crate::device_map::{self, DeviceMapper};
-use crate::distributed::{self, use_ring, WorkerTransferData};
+use crate::distributed::{self, WorkerTransferData};
 #[cfg(feature = "cuda")]
 use crate::kv_cache::RecurrentStateSnapshot;
 use crate::kv_cache::{FullCacheManager, HybridCacheManager, NormalCacheManager};
@@ -184,6 +184,7 @@ impl MultimodalLoaderBuilder {
             Some(MultimodalLoaderType::Idefics2) => Box::new(Idefics2Loader),
             Some(MultimodalLoaderType::LLaVANext) => Box::new(LLaVANextLoader),
             Some(MultimodalLoaderType::LLaVA) => Box::new(LLaVALoader),
+            Some(MultimodalLoaderType::Lfm2Vl) => Box::new(Lfm2VlLoader),
             Some(MultimodalLoaderType::VLlama) => Box::new(VLlamaLoader),
             Some(MultimodalLoaderType::Qwen2VL) => Box::new(Qwen2VLLoader),
             Some(MultimodalLoaderType::Idefics3) => Box::new(Idefics3Loader),
@@ -293,13 +294,20 @@ impl Loader for MultimodalLoader {
         debug!("Prompt chunk size is {ATTENTION_CHUNK_SIZE}.");
 
         let use_nccl = mistralrs_quant::distributed::use_nccl();
+        let write_uqff = self.config.write_uqff.is_some();
+        let tensor_parallelism = distributed::resolve_tensor_parallelism(
+            self.inner.model_config(&config)?.as_ref(),
+            use_nccl,
+            write_uqff,
+        )?;
+        let use_distributed = tensor_parallelism.is_enabled();
         let device = device.clone();
 
         let available_devices = if let Ok(payload) = env::var(distributed::IS_DAEMON_FLAG) {
             let payload: WorkerTransferData = serde_json::from_str(&payload)?;
-            let WorkerTransferData::Init { id: _, worker_rank } = payload;
+            let WorkerTransferData::Init { worker_rank, .. } = payload;
             vec![candle_core::Device::new_cuda(worker_rank + 1)?]
-        } else if use_nccl || use_ring() {
+        } else if use_distributed {
             vec![candle_core::Device::new_cuda(0)?]
         } else {
             device_map::get_all_similar_devices(&device)?
@@ -310,7 +318,7 @@ impl Loader for MultimodalLoader {
                 unsafe { dev.disable_event_tracking() };
             }
         }
-        let device = if use_nccl || use_ring() {
+        let device = if use_distributed {
             available_devices[0].clone()
         } else {
             device
@@ -344,7 +352,9 @@ impl Loader for MultimodalLoader {
 
         // If auto, convert to Map if not using nccl
         let mut max_kv_tokens: Option<usize> = None;
-        if use_nccl || use_ring() {
+        if write_uqff {
+            mapper = DeviceMapSetting::dummy();
+        } else if use_distributed {
             mapper = DeviceMapSetting::DummyNccl {
                 nm_device: available_devices[0].clone(),
             };
@@ -438,16 +448,27 @@ impl Loader for MultimodalLoader {
             mapper = DeviceMapSetting::Map(new);
         }
 
+        let mapper_device = if write_uqff {
+            Device::Cpu
+        } else {
+            device.clone()
+        };
+        let mapper_topology = if write_uqff {
+            None
+        } else {
+            self.config.topology.as_ref()
+        };
+
         let pipeline_mapper = mapper.into_mapper(
             self.inner.num_layers(&config)?,
-            &device,
-            self.config.topology.as_ref(),
+            &mapper_device,
+            mapper_topology,
             &available_devices,
         )?;
         let mapper = mapper.into_mapper(
             self.inner.num_layers(&config)?,
-            &device,
-            self.config.topology.as_ref(),
+            &mapper_device,
+            mapper_topology,
             &available_devices,
         )?;
         let mut layer_devices = Vec::new();
@@ -455,7 +476,12 @@ impl Loader for MultimodalLoader {
             let device = mapper.device_for(layer, false).cloned();
             layer_devices.push(device);
         }
-        let dtype = mapper.get_min_dtype(dtype)?;
+        let dtype = super::isq_flow::resolve_weight_load_dtype(
+            dtype,
+            mapper.as_ref(),
+            &available_devices,
+            write_uqff,
+        )?;
 
         // TODO: PagedAttention is not supported with CPU for now.
         // This check is not really necessary because `get_device_layers` should prevent it.
@@ -513,11 +539,12 @@ impl Loader for MultimodalLoader {
             .message("model")
         );
 
-        let (model, tracker) = if use_nccl || use_ring() {
+        let (model, tracker) = if use_distributed {
             let (mapper, sharded_vb) = distributed::prepare_distributed_mapper(
                 dtype,
                 &device,
                 &available_devices,
+                tensor_parallelism.world_size(),
                 silent,
                 &config,
                 loading_isq,
@@ -801,6 +828,7 @@ impl Loader for MultimodalLoader {
                 cache_engine,
                 model_metadata: Some(model_metadata),
                 modalities: self.inner.modalities(&config)?,
+                loaded_for_uqff_write: self.config.write_uqff.is_some(),
             }),
             processor,
             prefixer: self.inner.prefixer(&config),

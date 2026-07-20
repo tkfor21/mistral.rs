@@ -3,8 +3,8 @@ use std::sync::{atomic::AtomicUsize, Arc};
 use candle_core::{quantized::GgmlDType, Device, Result, Tensor};
 
 use crate::{
-    get_immediate_isq, pending_layer, ImmediateIsqMatch, ImmediateIsqParams, IsqType,
-    PendingIsqLayer, QuantMethod, ShardedVarBuilder, TrackedModule,
+    get_immediate_isq, pending_layer, ImmediateIsqMatch, ImmediateIsqParams, IsqConsumer,
+    IsqRequest, IsqType, PendingIsqLayer, QuantMethod, ShardedVarBuilder, TrackedModule,
 };
 
 pub enum QuantizationBehavior {
@@ -49,7 +49,11 @@ fn apply_immediate_isq_inner(
     };
     let prefix = format!("{}.weight", vb.prefix());
     if let Some(ImmediateIsqMatch { ty, device }) = crate::resolve_immediate_isq(&params, &prefix) {
-        let device = device.unwrap_or_else(|| vb.device().clone());
+        let device = if params.capture == crate::IsqCaptureMode::CaptureAll {
+            Device::Cpu
+        } else {
+            device.unwrap_or_else(|| vb.device().clone())
+        };
 
         // Capture modes keep the layer unquantized; the resolved ty is recorded for later.
         let spawn_ty = match params.capture {
@@ -77,34 +81,35 @@ pub(crate) fn spawn_pending_isq(
     params: &ImmediateIsqParams,
     module_key: String,
 ) -> Arc<PendingIsqLayer> {
-    params.backpressure.acquire();
-    let backpressure = params.backpressure.clone();
-    let guard = params.guard.clone().with_module_key(module_key);
-    let (tx, rx) = pending_layer::pending_isq_channel();
-    params.pool.spawn(move || {
-        let result = layer
-            .clone()
-            .apply_isq(ty, device, &AtomicUsize::new(0), None, guard);
-        let _ = tx.send(result);
-        backpressure.release();
-    });
+    let guard = params.guard.clone().with_module_key(module_key.clone());
+    let request = IsqRequest {
+        ty,
+        device: device.clone(),
+        has_imatrix: false,
+        capture: params.capture,
+        consumer: IsqConsumer::ImmediateLoad,
+        module_key,
+    };
+    let rx = match layer.plan_isq(&request) {
+        Ok(plan) => params.executor.submit(plan, request.consumer, move || {
+            layer
+                .clone()
+                .apply_isq(ty, device, &AtomicUsize::new(0), None, guard)
+        }),
+        Err(e) => {
+            let (tx, rx) = pending_layer::pending_isq_channel();
+            let _ = tx.send(Err(e));
+            rx
+        }
+    };
     Arc::new(PendingIsqLayer::new(rx))
 }
 
 /// In-flight parallel requantization; receivers are in the same order as the input modules.
 /// Holds the pool so spawned jobs outlive the call.
 pub struct RequantizeHandles {
-    _pool: rayon::ThreadPool,
+    _executor: crate::IsqExecutor,
     pub receivers: Vec<pending_layer::IsqReceiver>,
-}
-
-/// Where requantized layers should live.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum RequantizeResults {
-    /// On each module's device, ready to swap into the live model (imatrix, re-ISQ).
-    Resident,
-    /// Raw-block types stage on CPU so their serialized bytes are plain memory (UQFF writes)
-    CpuStaged,
 }
 
 /// Quantize a rebuilt `[E, out, in]` expert stack to `ty`: GGML types go slab-by-slab so each
@@ -138,18 +143,19 @@ pub fn quantize_expert_stack(
     )
 }
 
-/// Quantize every tracked module on a fresh pool sized for `pool_ty`. The per-module type is
-/// the caller's policy: `|m| m.ty.unwrap_or(default)` honors the load-time plan (topology pins),
-/// `|_| ty` forces a uniform type.
+/// Quantize every tracked module on an executor sized for `pool_ty`.
 pub fn requantize_tracked(
     modules: &[TrackedModule],
     pool_ty: IsqType,
-    results: RequantizeResults,
     ty_for: impl Fn(&TrackedModule) -> IsqType,
     imatrix_for: &dyn Fn(&str) -> Option<Vec<f32>>,
+    consumer: IsqConsumer,
+    extra_host_reserve_bytes: usize,
     report: Option<crate::QuantizationReport>,
 ) -> Result<RequantizeHandles> {
-    let (pool, _) = crate::create_isq_thread_pool(Some(pool_ty));
+    let config = crate::IsqExecutorConfig::new(Some(pool_ty))
+        .with_external_reserved_host_bytes(extra_host_reserve_bytes);
+    let (executor, _) = crate::create_isq_executor(config);
     let guard = crate::QuantizeOntoGuard::new();
     let mut receivers = Vec::with_capacity(modules.len());
     for module in modules {
@@ -165,14 +171,7 @@ pub fn requantize_tracked(
             }
             None
         };
-        // Types convertible to GgmlDType quantize into raw blocks; everything else is tensor-backed.
-        let device = if results == RequantizeResults::CpuStaged
-            && candle_core::quantized::GgmlDType::try_from(ty).is_ok()
-        {
-            Device::Cpu
-        } else {
-            layer.dtype_and_device().1
-        };
+        let device = layer.dtype_and_device().1;
         let mut guard = guard
             .clone()
             .with_module_key(module.key.clone())
@@ -180,18 +179,24 @@ pub fn requantize_tracked(
         if let Some(report) = &report {
             guard = guard.with_report(report.clone());
         }
-        let (tx, rx) = pending_layer::pending_isq_channel();
-        pool.spawn(move || {
-            let result =
-                layer
-                    .clone()
-                    .apply_isq(Some(ty), device, &AtomicUsize::new(0), imatrix, guard);
-            let _ = tx.send(result);
+        let request = IsqRequest {
+            ty: Some(ty),
+            device: device.clone(),
+            has_imatrix: imatrix.is_some(),
+            capture: crate::IsqCaptureMode::Immediate,
+            consumer,
+            module_key: module.key.clone(),
+        };
+        let plan = layer.plan_isq(&request)?;
+        let rx = executor.submit(plan, consumer, move || {
+            layer
+                .clone()
+                .apply_isq(Some(ty), device, &AtomicUsize::new(0), imatrix, guard)
         });
         receivers.push(rx);
     }
     Ok(RequantizeHandles {
-        _pool: pool,
+        _executor: executor,
         receivers,
     })
 }

@@ -15,8 +15,6 @@ pub use pipeline::Pipeline;
 #[cfg(feature = "pyo3_macros")]
 use pyo3::exceptions::PyValueError;
 use std::collections::{HashMap, HashSet};
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use std::{
@@ -31,12 +29,22 @@ use std::{
 use tokio::sync::mpsc::{channel, Sender};
 use tracing::{debug, info, warn};
 
+fn build_engine_runtime() -> Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(candle_core::utils::get_num_threads())
+        .on_thread_start(candle_core::utils::set_thread_affinity)
+        .build()
+        .unwrap()
+}
+
 pub const MISTRALRS_GIT_REVISION: &str = match option_env!("MISTRALRS_GIT_REVISION") {
     Some(value) => value,
     None => "unknown",
 };
 pub const MISTRALRS_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+mod agent_approval;
 mod cuda;
 mod device_map;
 mod engine;
@@ -73,6 +81,7 @@ mod layers_masker;
 mod layers_utils;
 pub mod matformer;
 mod mla;
+pub mod model_metadata;
 mod models;
 mod paged_attention;
 mod perf_flags;
@@ -80,6 +89,7 @@ mod pipeline;
 mod prefix_cacher;
 pub mod reasoning_parsers;
 mod request;
+pub mod resource_plan;
 mod response;
 mod sampler;
 mod scheduler;
@@ -102,12 +112,25 @@ pub use tuning::{
     auto_tune, AutoTuneRequest, AutoTuneResult, FitStatus, QualityTier, TuneCandidate, TuneProfile,
 };
 
+pub use agent_approval::{
+    AgentToolApproval, AgentToolApprovalAsyncCallback, AgentToolApprovalCallback,
+    AgentToolApprovalDecision, AgentToolApprovalFuture, AgentToolApprovalHandler,
+};
 pub use amoe::{AnyMoeConfig, AnyMoeExpertType};
 pub use device_map::{
     DeviceLayerMapMetadata, DeviceMapMetadata, DeviceMapSetting, LayerDeviceMapper,
 };
+pub use files::{
+    format_from_name, is_text_mime, mime_for_format, File, FileContent, FileSource, FileStore,
+    RequestedFile, FILE_PURPOSE_AGENT_OUTPUT, FILE_PURPOSE_USER_DATA, MODEL_INLINE_BYTES,
+    WIRE_EMBED_LIMIT_BYTES,
+};
 pub use gguf::{GGUFArchitecture, GGUF_MULTI_FILE_DELIMITER};
 pub use mistralrs_audio::AudioInput;
+pub use mistralrs_code_exec::{
+    CodeExecutionApproval, CodeExecutionApprovalCallback, CodeExecutionConfig, ShellConfig,
+    DEFAULT_CODE_EXEC_TIMEOUT_SECS, DEFAULT_SHELL_TIMEOUT_SECS,
+};
 pub use mistralrs_mcp::{
     AgentPermission, AgentToolApprovalNotifier, AgentToolApprovalRequest, AgentToolKind,
     AgentToolMetadata, AgentToolSource, CalledFunction, CodeExecutionApprovalNotifier,
@@ -120,216 +143,6 @@ pub use mistralrs_mcp::{
 };
 pub use mistralrs_quant::{IsqBits, IsqType, MULTI_LORA_DELIMITER};
 pub use mistralrs_sandbox::{NetworkMode, SandboxPolicy};
-
-pub const DEFAULT_CODE_EXEC_TIMEOUT_SECS: u64 = 60;
-pub const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 600;
-
-/// Python code execution config.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub struct CodeExecutionConfig {
-    /// Defaults to `python3` (`python` on Windows).
-    #[serde(default = "default_python_path")]
-    pub python_path: std::path::PathBuf,
-    /// Per-execution timeout. Defaults to 60s.
-    #[serde(default = "default_code_exec_timeout_secs")]
-    pub timeout_secs: u64,
-    /// If `None`, a temp dir is created. Otherwise this is the cwd for the model's code.
-    #[serde(default)]
-    pub working_directory: Option<std::path::PathBuf>,
-    /// OS-level sandbox policy. `Some(policy)` enables the platform sandbox
-    /// (Linux/macOS) with the given limits; `None` disables it entirely.
-    /// The CLI/server layer is responsible for choosing.
-    #[serde(default)]
-    pub sandbox_policy: Option<mistralrs_sandbox::SandboxPolicy>,
-    #[serde(default)]
-    pub permission: CodeExecutionPermission,
-    #[serde(skip)]
-    pub approval_callback: Option<CodeExecutionApprovalCallback>,
-}
-
-impl std::fmt::Debug for CodeExecutionConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CodeExecutionConfig")
-            .field("python_path", &self.python_path)
-            .field("timeout_secs", &self.timeout_secs)
-            .field("working_directory", &self.working_directory)
-            .field("sandbox_policy", &self.sandbox_policy)
-            .field("permission", &self.permission)
-            .field("approval_callback", &self.approval_callback.is_some())
-            .finish()
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct AgentToolApproval {
-    pub approval_id: String,
-    pub session_id: String,
-    pub round: usize,
-    pub tool: AgentToolMetadata,
-    pub arguments: serde_json::Value,
-}
-
-#[derive(Clone, Debug)]
-pub struct AgentToolApprovalDecision {
-    pub approve: bool,
-    pub remember_for_session: bool,
-    pub message: Option<String>,
-}
-
-impl AgentToolApprovalDecision {
-    pub fn approve() -> Self {
-        Self {
-            approve: true,
-            remember_for_session: false,
-            message: None,
-        }
-    }
-
-    pub fn approve_for_session() -> Self {
-        Self {
-            approve: true,
-            remember_for_session: true,
-            message: None,
-        }
-    }
-
-    pub fn deny(message: Option<String>) -> Self {
-        Self {
-            approve: false,
-            remember_for_session: false,
-            message,
-        }
-    }
-
-    pub fn deny_with_message(message: impl Into<String>) -> Self {
-        Self {
-            approve: false,
-            remember_for_session: false,
-            message: Some(message.into()),
-        }
-    }
-
-    pub fn with_remember_for_session(mut self, remember_for_session: bool) -> Self {
-        self.remember_for_session = remember_for_session;
-        self
-    }
-}
-
-pub type AgentToolApprovalCallback =
-    Arc<dyn Fn(&AgentToolApproval) -> AgentToolApprovalDecision + Send + Sync + 'static>;
-
-pub type AgentToolApprovalFuture =
-    Pin<Box<dyn Future<Output = AgentToolApprovalDecision> + Send + 'static>>;
-pub type AgentToolApprovalAsyncCallback =
-    Arc<dyn Fn(AgentToolApproval) -> AgentToolApprovalFuture + Send + Sync + 'static>;
-
-#[derive(Clone)]
-pub enum AgentToolApprovalHandler {
-    Sync(AgentToolApprovalCallback),
-    Async(AgentToolApprovalAsyncCallback),
-}
-
-impl AgentToolApprovalHandler {
-    pub fn from_sync(callback: AgentToolApprovalCallback) -> Self {
-        Self::Sync(callback)
-    }
-
-    pub fn from_async(callback: AgentToolApprovalAsyncCallback) -> Self {
-        Self::Async(callback)
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct CodeExecutionApproval {
-    pub approval_id: String,
-    pub session_id: String,
-    pub code: String,
-    pub outputs: Vec<String>,
-    pub working_directory: Option<std::path::PathBuf>,
-}
-
-pub type CodeExecutionApprovalCallback =
-    Arc<dyn Fn(&CodeExecutionApproval) -> bool + Send + Sync + 'static>;
-
-fn default_python_path() -> std::path::PathBuf {
-    if cfg!(windows) {
-        std::path::PathBuf::from("python")
-    } else {
-        std::path::PathBuf::from("python3")
-    }
-}
-fn default_code_exec_timeout_secs() -> u64 {
-    DEFAULT_CODE_EXEC_TIMEOUT_SECS
-}
-
-fn default_shell_timeout_secs() -> u64 {
-    DEFAULT_SHELL_TIMEOUT_SECS
-}
-
-impl Default for CodeExecutionConfig {
-    fn default() -> Self {
-        Self {
-            python_path: default_python_path(),
-            timeout_secs: default_code_exec_timeout_secs(),
-            working_directory: None,
-            sandbox_policy: None,
-            permission: CodeExecutionPermission::Auto,
-            approval_callback: None,
-        }
-    }
-}
-
-/// Shell execution config.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub struct ShellConfig {
-    #[serde(default = "default_shell_path")]
-    pub shell_path: std::path::PathBuf,
-    #[serde(default = "default_shell_timeout_secs")]
-    pub timeout_secs: u64,
-    #[serde(default)]
-    pub working_directory: Option<std::path::PathBuf>,
-    #[serde(default)]
-    pub sandbox_policy: Option<mistralrs_sandbox::SandboxPolicy>,
-    #[serde(default)]
-    pub permission: AgentPermission,
-}
-
-impl std::fmt::Debug for ShellConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ShellConfig")
-            .field("shell_path", &self.shell_path)
-            .field("timeout_secs", &self.timeout_secs)
-            .field("working_directory", &self.working_directory)
-            .field("sandbox_policy", &self.sandbox_policy)
-            .field("permission", &self.permission)
-            .finish()
-    }
-}
-
-fn default_shell_path() -> std::path::PathBuf {
-    if cfg!(windows) {
-        std::path::PathBuf::from("cmd")
-    } else {
-        std::path::PathBuf::from("/bin/sh")
-    }
-}
-
-impl Default for ShellConfig {
-    fn default() -> Self {
-        Self {
-            shell_path: default_shell_path(),
-            timeout_secs: default_shell_timeout_secs(),
-            working_directory: None,
-            sandbox_policy: None,
-            permission: AgentPermission::Auto,
-        }
-    }
-}
-pub use files::{
-    format_from_name, is_text_mime, mime_for_format, File, FileContent, FileSource, FileStore,
-    RequestedFile, FILE_PURPOSE_AGENT_OUTPUT, FILE_PURPOSE_USER_DATA, MODEL_INLINE_BYTES,
-    WIRE_EMBED_LIMIT_BYTES,
-};
 pub use paged_attention::{MemoryGpuConfig, PagedAttentionConfig, PagedCacheType};
 pub use pipeline::hf::{
     get_model_file, hf_home_dir, hf_hub_cache_dir, hf_token_path, is_hf_hub_offline,
@@ -357,6 +170,9 @@ pub use request::{
     NormalRequest, ReasoningEffort, Request, RequestMessage, SearchContextSize,
     TokenizationRequest, WebSearchContentType, WebSearchFilters, WebSearchImageSettings,
     WebSearchOptions, WebSearchReturnTokenBudget, WebSearchUserLocation,
+};
+pub use resource_plan::{
+    plan_paged_kv, PagedKvModelRequest, PagedKvPlan, PagedKvPolicy, RuntimeResourcePlanOptions,
 };
 pub use response::*;
 pub use sampler::{
@@ -526,7 +342,7 @@ pub struct UnloadedModelState {
 /// Internal structure to hold per-engine state
 struct EngineInstance {
     sender: Sender<Request>,
-    engine_handler: JoinHandle<()>,
+    engine_handler: Option<JoinHandle<()>>,
     reboot_state: RebootState,
     config: MistralRsConfig,
     category: ModelCategory,
@@ -542,6 +358,26 @@ impl Drop for EngineInstance {
         // Free decode graphs (they capture the engine thread's cuTile modules) before it exits when `sender` drops.
         if let Ok(pipeline) = self.reboot_state.pipeline.try_lock() {
             pipeline.cleanup_cuda_graphs();
+        }
+    }
+}
+
+impl EngineInstance {
+    fn is_finished(&self) -> bool {
+        self.engine_handler
+            .as_ref()
+            .is_none_or(JoinHandle::is_finished)
+    }
+
+    fn terminate(&self) {
+        let _ = self.sender.try_send(Request::Terminate);
+    }
+
+    fn join(&mut self) {
+        if let Some(handle) = self.engine_handler.take() {
+            if handle.join().is_err() {
+                warn!("Engine thread panicked during shutdown.");
+            }
         }
     }
 }
@@ -634,7 +470,7 @@ pub enum MistralRsError {
 
 impl std::fmt::Display for MistralRsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", &self)
+        write!(f, "{:?}", self)
     }
 }
 
@@ -667,6 +503,7 @@ pub struct MistralRsBuilder {
     loader_config: Option<ModelLoaderConfig>,
     code_exec_config: Option<CodeExecutionConfig>,
     shell_config: Option<ShellConfig>,
+    defer_daemon_start: bool,
 }
 
 impl MistralRsBuilder {
@@ -696,6 +533,7 @@ impl MistralRsBuilder {
             loader_config: None,
             code_exec_config: None,
             shell_config: None,
+            defer_daemon_start: false,
         }
     }
 
@@ -814,6 +652,11 @@ impl MistralRsBuilder {
         self
     }
 
+    pub fn with_deferred_daemon_start(mut self, defer_daemon_start: bool) -> Self {
+        self.defer_daemon_start = defer_daemon_start;
+        self
+    }
+
     pub async fn build(self) -> Arc<MistralRs> {
         MistralRs::new(self).await
     }
@@ -823,15 +666,39 @@ impl Drop for MistralRs {
     fn drop(&mut self) {
         // Terminate all engines
         if let Ok(engines) = self.engines.read() {
-            for (_, engine) in engines.iter() {
+            for engine in engines.values() {
                 // Use try_send instead of blocking_send to avoid runtime panics
-                let _ = engine.sender.try_send(Request::Terminate);
+                engine.terminate();
             }
         }
     }
 }
 
 impl MistralRs {
+    pub async fn shutdown(self: Arc<Self>) -> Result<(), String> {
+        let mut this =
+            Arc::try_unwrap(self).map_err(|_| "Cannot shutdown while MistralRs is shared")?;
+        let engines = this
+            .engines
+            .get_mut()
+            .map_err(|_| "Failed to get mutable access to engines during shutdown")?;
+        let mut engines = std::mem::take(engines);
+
+        let senders = engines
+            .values()
+            .map(|engine| engine.sender.clone())
+            .collect::<Vec<_>>();
+        for sender in senders {
+            let _ = sender.send(Request::Terminate).await;
+        }
+
+        for engine in engines.values_mut() {
+            engine.join();
+        }
+
+        Ok(())
+    }
+
     /// Create an engine instance with the given configuration
     fn create_engine_instance(
         pipeline: Arc<tokio::sync::Mutex<dyn Pipeline>>,
@@ -890,9 +757,10 @@ impl MistralRs {
         // Propagate Engine::new's outcome so a creation failure is a clean load error, not a zombie-engine panic.
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
         let engine_handler = thread::spawn(move || {
+            candle_core::utils::init_global_threadpool();
             #[cfg(feature = "metal")]
             objc::rc::autoreleasepool(move || {
-                let rt = Runtime::new().unwrap();
+                let rt = build_engine_runtime();
                 rt.block_on(async move {
                     file_store_for_engine.spawn_cleanup_task();
                     let engine = match Engine::new(
@@ -931,7 +799,7 @@ impl MistralRs {
 
             #[cfg(not(feature = "metal"))]
             {
-                let rt = Runtime::new().unwrap();
+                let rt = build_engine_runtime();
                 rt.block_on(async move {
                     file_store_for_engine.spawn_cleanup_task();
                     let engine = match Engine::new(
@@ -979,7 +847,7 @@ impl MistralRs {
 
         Ok(EngineInstance {
             sender: tx,
-            engine_handler,
+            engine_handler: Some(engine_handler),
             reboot_state,
             config: mistralrs_config,
             category,
@@ -1041,39 +909,7 @@ impl MistralRs {
 
         #[cfg(feature = "code-execution")]
         if let Some(code_exec_cfg) = code_exec_config {
-            let approval_callback = code_exec_cfg.approval_callback.as_ref().map(|callback| {
-                let callback = Arc::clone(callback);
-                Arc::new(
-                    move |approval: &mistralrs_code_exec::CodeExecutionApproval| {
-                        let approval = CodeExecutionApproval {
-                            approval_id: approval.approval_id.clone(),
-                            session_id: approval.session_id.clone(),
-                            code: approval.code.clone(),
-                            outputs: approval.outputs.clone(),
-                            working_directory: approval.working_directory.clone(),
-                        };
-                        callback(&approval)
-                    },
-                ) as Arc<mistralrs_code_exec::CodeExecutionApprovalCallback>
-            });
-            let exec_config = mistralrs_code_exec::CodeExecutionConfig {
-                python_path: code_exec_cfg.python_path.clone(),
-                timeout_secs: code_exec_cfg.timeout_secs,
-                working_directory: code_exec_cfg.working_directory.clone(),
-                sandbox_policy: code_exec_cfg.sandbox_policy.clone(),
-                permission: match code_exec_cfg.permission {
-                    CodeExecutionPermission::Auto => {
-                        mistralrs_code_exec::CodeExecutionPermission::Auto
-                    }
-                    CodeExecutionPermission::Ask => {
-                        mistralrs_code_exec::CodeExecutionPermission::Ask
-                    }
-                    CodeExecutionPermission::Deny => {
-                        mistralrs_code_exec::CodeExecutionPermission::Deny
-                    }
-                },
-                approval_callback,
-            };
+            let exec_config = code_exec_cfg.clone();
             match mistralrs_code_exec::CodeExecutionManager::new(exec_config).await {
                 Ok(manager) => {
                     let input_modalities: Vec<mistralrs_code_exec::InputModality> = {
@@ -1152,13 +988,7 @@ impl MistralRs {
 
         #[cfg(feature = "code-execution")]
         if let Some(shell_cfg) = shell_config {
-            let shell_config = mistralrs_code_exec::ShellConfig {
-                shell_path: shell_cfg.shell_path.clone(),
-                timeout_secs: shell_cfg.timeout_secs,
-                working_directory: shell_cfg.working_directory.clone(),
-                sandbox_policy: shell_cfg.sandbox_policy.clone(),
-                permission: shell_cfg.permission,
-            };
+            let shell_config = shell_cfg.clone();
             match mistralrs_code_exec::ShellManager::new(shell_config).await {
                 Ok(manager) => {
                     let effective = manager.effective_protection();
@@ -1231,10 +1061,17 @@ impl MistralRs {
             code_exec_config,
             #[cfg_attr(not(feature = "code-execution"), allow(unused_variables))]
             shell_config,
+            defer_daemon_start,
         } = config;
 
         let device = get_mut_arcmutex!(pipeline).device();
         mistralrs_quant::cublaslt::maybe_init_cublas_lt_wrapper(device.clone());
+        #[cfg(feature = "cuda")]
+        match cuda::preload::preload_candle_ptx(&device) {
+            Ok(count) if count > 0 => info!("Preloaded {count} Candle CUDA PTX functions."),
+            Ok(_) => {}
+            Err(err) => warn!("Failed to preload Candle CUDA PTX functions: {err}"),
+        }
 
         let no_kv_cache = no_kv_cache.unwrap_or(false);
         let no_prefix_cache = no_prefix_cache.unwrap_or(false);
@@ -1292,7 +1129,7 @@ impl MistralRs {
             None => (pipeline_name.clone(), HashMap::new()),
         };
 
-        if distributed::is_daemon() {
+        if distributed::is_daemon() && !defer_daemon_start {
             let request_sender = engine_instance.sender.clone();
 
             if cfg!(feature = "ring") {
@@ -1311,9 +1148,13 @@ impl MistralRs {
         let is_multi_threaded = tokio::runtime::Handle::try_current()
             .is_ok_and(|h| h.runtime_flavor() != tokio::runtime::RuntimeFlavor::CurrentThread);
 
-        // Do a dummy run
+        // Do a dummy run; skip UQFF writes, whose CPU-resident model cannot serve requests.
+        let loaded_for_uqff_write = get_mut_arcmutex!(pipeline)
+            .get_metadata()
+            .loaded_for_uqff_write;
         if !distributed::is_daemon()
             && is_multi_threaded
+            && !loaded_for_uqff_write
             && matches!(
                 engine_instance.category,
                 ModelCategory::Text | ModelCategory::Multimodal { .. }
@@ -1412,7 +1253,7 @@ impl MistralRs {
         })?;
 
         if let Some(engine_instance) = engines.get(model_id) {
-            if !engine_instance.engine_handler.is_finished() {
+            if !engine_instance.is_finished() {
                 tracing::info!("Engine {} already running, returning ok", model_id);
                 return Ok(());
             }
@@ -1454,7 +1295,7 @@ impl MistralRs {
         })?;
 
         if let Some(engine_instance) = engines.get(model_id) {
-            Ok(engine_instance.engine_handler.is_finished())
+            Ok(engine_instance.is_finished())
         } else {
             Err(MistralRsError::EnginePoisoned)
         }
@@ -2078,6 +1919,30 @@ impl MistralRs {
         sender
             .blocking_send(request)
             .map_err(|_| MistralRsError::SenderPoisoned)
+    }
+
+    pub async fn send_request_async(&self, mut request: Request) -> Result<(), MistralRsError> {
+        let model_id = match &mut request {
+            Request::Normal(normal_req) => normal_req.model_id.as_deref(),
+            _ => None,
+        };
+
+        let sender = self.get_sender(model_id)?;
+        sender
+            .send(request)
+            .await
+            .map_err(|_| MistralRsError::SenderPoisoned)
+    }
+
+    pub fn run_daemon_replicator_forever(self: Arc<Self>) -> ! {
+        if cfg!(feature = "ring") {
+            distributed::ring_daemon_replicator_mistralrs(self);
+        } else {
+            distributed::nccl_daemon_replicator_mistralrs(self);
+        }
+
+        #[allow(clippy::empty_loop)]
+        loop {}
     }
 
     pub fn maybe_log_request(this: Arc<Self>, repr: String) {

@@ -9,7 +9,7 @@ use super::{
 };
 use crate::attention::ATTENTION_CHUNK_SIZE;
 use crate::device_map::{self, DeviceMapper};
-use crate::distributed::{self, use_ring, WorkerTransferData};
+use crate::distributed::{self, WorkerTransferData};
 use crate::embedding_models::inputs_processor::{EmbeddingProcessor, ModelInputs};
 use crate::embedding_models::{Dense, DenseActivation, Normalize, Pooling};
 use crate::embedding_normal_model_loader;
@@ -251,12 +251,19 @@ impl Loader for EmbeddingLoader {
         debug!("Prompt chunk size is {ATTENTION_CHUNK_SIZE}.");
 
         let use_nccl = mistralrs_quant::distributed::use_nccl();
+        let write_uqff = self.config.write_uqff.is_some();
+        let tensor_parallelism = distributed::resolve_tensor_parallelism(
+            self.inner.model_config(&config)?.as_ref(),
+            use_nccl,
+            write_uqff,
+        )?;
+        let use_distributed = tensor_parallelism.is_enabled();
 
         let available_devices = if let Ok(payload) = env::var(distributed::IS_DAEMON_FLAG) {
             let payload: WorkerTransferData = serde_json::from_str(&payload)?;
-            let WorkerTransferData::Init { id: _, worker_rank } = payload;
+            let WorkerTransferData::Init { worker_rank, .. } = payload;
             vec![candle_core::Device::new_cuda(worker_rank + 1)?]
-        } else if use_nccl || use_ring() {
+        } else if use_distributed {
             vec![candle_core::Device::new_cuda(0)?]
         } else {
             device_map::get_all_similar_devices(device)?
@@ -267,7 +274,7 @@ impl Loader for EmbeddingLoader {
                 unsafe { dev.disable_event_tracking() };
             }
         }
-        let device = if use_nccl || use_ring() {
+        let device = if use_distributed {
             available_devices[0].clone()
         } else {
             device.clone()
@@ -279,7 +286,9 @@ impl Loader for EmbeddingLoader {
         };
 
         // If auto, convert to Map if not using nccl
-        if use_nccl || use_ring() {
+        if write_uqff {
+            mapper = DeviceMapSetting::dummy();
+        } else if use_distributed {
             mapper = DeviceMapSetting::DummyNccl {
                 nm_device: available_devices[0].clone(),
             };
@@ -369,16 +378,27 @@ impl Loader for EmbeddingLoader {
             mapper = DeviceMapSetting::Map(new);
         }
 
+        let mapper_device = if write_uqff {
+            Device::Cpu
+        } else {
+            device.clone()
+        };
+        let mapper_topology = if write_uqff {
+            None
+        } else {
+            self.config.topology.as_ref()
+        };
+
         let pipeline_mapper = mapper.into_mapper(
             self.inner.num_layers(&config)?,
-            &device,
-            self.config.topology.as_ref(),
+            &mapper_device,
+            mapper_topology,
             &available_devices,
         )?;
         let mapper = mapper.into_mapper(
             self.inner.num_layers(&config)?,
-            &device,
-            self.config.topology.as_ref(),
+            &mapper_device,
+            mapper_topology,
             &available_devices,
         )?;
         let mut layer_devices = Vec::new();
@@ -386,7 +406,12 @@ impl Loader for EmbeddingLoader {
             let device = mapper.device_for(layer, false).cloned();
             layer_devices.push(device);
         }
-        let dtype = mapper.get_min_dtype(dtype)?;
+        let dtype = super::isq_flow::resolve_weight_load_dtype(
+            dtype,
+            mapper.as_ref(),
+            &available_devices,
+            write_uqff,
+        )?;
 
         trace!("Model config: {:?}", self.inner.get_config_repr(&config)?);
         if crate::using_flash_attn() {
@@ -475,11 +500,12 @@ impl Loader for EmbeddingLoader {
             .message(self.load_context.weight_target())
         );
 
-        let (model, tracker) = if use_nccl || use_ring() {
+        let (model, tracker) = if use_distributed {
             let (mapper, sharded_vb) = distributed::prepare_distributed_mapper(
                 dtype,
                 &device,
                 &available_devices,
+                tensor_parallelism.world_size(),
                 silent,
                 &config,
                 loading_isq,
@@ -627,6 +653,7 @@ impl Loader for EmbeddingLoader {
                     input: vec![SupportedModality::Text],
                     output: vec![SupportedModality::Embedding],
                 },
+                loaded_for_uqff_write: self.config.write_uqff.is_some(),
             }),
             mapper: pipeline_mapper,
             modules,
