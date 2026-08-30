@@ -69,6 +69,10 @@ impl QuantizedSerde for DynamicLoraLinear {
         self.base.isq_serde_supported()
     }
 
+    fn uqff_type(&self) -> Option<IsqType> {
+        self.base.uqff_type()
+    }
+
     fn serialize_uqff(&self, prefix: &str, ty: IsqType) -> Result<Vec<UqffTensor>> {
         self.base.serialize_uqff(prefix, ty)
     }
@@ -143,6 +147,21 @@ impl QuantMethod for DynamicLoraLinear {
             Ok(None)
         } else {
             self.base.try_gguf_affine_forward_raw(a)
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn try_forward_fused_split_glu(
+        &self,
+        input: &Tensor,
+        split_size: usize,
+        activation: crate::GluActivationType,
+    ) -> Result<Option<Tensor>> {
+        if self.site_is_active() {
+            Ok(None)
+        } else {
+            self.base
+                .try_forward_fused_split_glu(input, split_size, activation)
         }
     }
 

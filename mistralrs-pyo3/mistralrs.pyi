@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 from enum import Enum
 from os import PathLike
-from typing import Any, Iterator, Mapping, Optional, Callable
+from typing import Any, Callable, Iterator, Literal, Mapping, Optional
 
 class CalibrationStatus:
     collecting: bool
@@ -142,8 +142,13 @@ class ChatCompletionRequest:
       `AgentToolApproval`. Return `True`, `False`, or
       `AgentToolApprovalDecision`.
 
-    See [agent permissions](/mistral.rs/guides/agents/permissions-and-approvals/)
+    See [agent permissions](/guides/agents/permissions-and-approvals/)
     for the shared CLI, HTTP, Python, and Rust behavior.
+
+    `reasoning_effort` accepts `off`, `low`, `medium`, `high`, and `xhigh`; `none`
+    aliases `off`. Values are trimmed and case-insensitive. If both reasoning controls
+    are omitted, thinking is enabled with no selected effort. Contradictory
+    `enable_thinking` and `reasoning_effort` values raise `ValueError`.
     """
 
     messages: (
@@ -175,7 +180,9 @@ class ChatCompletionRequest:
     web_search_options: WebSearchOptions | None = None
     enable_thinking: bool | None = None
     truncate_sequence: bool = False
-    reasoning_effort: str | None = None
+    reasoning_effort: (
+        Literal["off", "none", "low", "medium", "high", "xhigh"] | None
+    ) = None
     max_tool_rounds: int | None = None
     tool_dispatch_url: str | None = None
     enable_code_execution: bool = False
@@ -189,6 +196,7 @@ class ChatCompletionRequest:
     session_id: str | None = None
     files: list[RequestedFile] | None = None
     input_files: list[InputFile] | None = None
+    ignore_eos: bool = False
     adapter: str | LoraAdapterGeneration | None = field(default=None, kw_only=True)
 
 @dataclass
@@ -223,6 +231,7 @@ class CompletionRequest:
     dry_allowed_length: int | None = None
     dry_sequence_breakers: list[str] | None = None
     truncate_sequence: bool = False
+    ignore_eos: bool = False
     adapter: str | LoraAdapterGeneration | None = field(default=None, kw_only=True)
 
 @dataclass
@@ -288,6 +297,7 @@ class MultimodalArchitecture(Enum):
     Qwen3_5Moe = "Qwen3_5Moe"
     Voxtral = "Voxtral"
     Gemma4 = "Gemma4"
+    MuseGlimmer = "MuseGlimmer"
     DiffusionGemma = "DiffusionGemma"
 
 @dataclass
@@ -543,15 +553,42 @@ class Which(Enum):
 
     @dataclass
     class GGUF:
+        """Select a GGUF model.
+
+        Pass `adapters=[]` or set a non-default LoRA limit to enable an empty dynamic LoRA runtime.
+        With `mmproj_filename`, adapters apply to the language model.
+        Pass `in_situ_quant` to `Runner` to requantize compatible GGUF weights while loading.
+        """
+
         quantized_model_id: str
         quantized_filename: str | list[str]
         tok_model_id: str | None = None
         topology: str | None = None
         dtype: ModelDType = ModelDType.Auto
         auto_map_params: TextAutoMapParams | None = None
+        tokenizer_json: str | None = field(default=None, kw_only=True)
+        mmproj_filename: str | list[str] | None = field(default=None, kw_only=True)
+        organization: IsqOrganization | None = field(default=None, kw_only=True)
+        write_uqff: str | None = field(default=None, kw_only=True)
+        imatrix: str | None = field(default=None, kw_only=True)
+        calibration_file: str | None = field(default=None, kw_only=True)
+        max_edge: int | None = field(default=None, kw_only=True)
+        multimodal_auto_map_params: MultimodalAutoMapParams | None = field(
+            default=None, kw_only=True
+        )
+        adapters: list[LoraAdapter] | None = field(default=None, kw_only=True)
+        max_adapters: int = field(default=16, kw_only=True)
+        max_rank: int = field(default=256, kw_only=True)
+        max_bytes: int = field(default=8589934592, kw_only=True)
+        hf_cache_path: str | None = field(default=None, kw_only=True)
+        matformer_config_path: str | None = field(default=None, kw_only=True)
+        matformer_slice_name: str | None = field(default=None, kw_only=True)
+        encoder_cache_memory_bytes: int | None = field(default=None, kw_only=True)
 
     @dataclass
     class XLoraGGUF:
+        """Select X-LoRA for a Phi3 GGUF configuration."""
+
         quantized_model_id: str
         quantized_filename: str | list[str]
         xlora_model_id: str
@@ -564,6 +601,11 @@ class Which(Enum):
 
     @dataclass
     class LoraGGUF:
+        """Select legacy static LoRA for a Phi3 GGUF configuration.
+
+        For dynamic adapters on a supported GGUF, pass `adapters` to `Which.GGUF`.
+        """
+
         quantized_model_id: str
         quantized_filename: str | list[str]
         adapters_model_id: str
@@ -628,6 +670,7 @@ class Which(Enum):
         matformer_config_path: str | None = None
         matformer_slice_name: str | None = None
         organization: IsqOrganization | None = None
+        encoder_cache_memory_bytes: int | None = None
 
     @dataclass
     class DiffusionPlain:
@@ -829,7 +872,7 @@ class Runner:
 
     def send_re_isq(self, dtype: str, model_id: str | None = None) -> None:
         """
-        Send a request to re-ISQ the model. If the model was loaded as GGUF or GGML then nothing will happen.
+        Re-ISQ a model that was loaded with `in_situ_quant`.
 
         Args:
             dtype: The ISQ dtype (e.g., "Q4K", "Q8_0").
@@ -878,7 +921,7 @@ class Runner:
         Args:
             text: The text to tokenize.
             add_special_tokens: Whether to add special tokens.
-            enable_thinking: Enables thinking for models that support this configuration.
+            enable_thinking: Compatibility argument; raw text tokenization does not render a chat template.
             model_id: Optional model ID to use for tokenization. If None, uses the default model.
         """
 

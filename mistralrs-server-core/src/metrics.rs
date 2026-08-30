@@ -4,33 +4,48 @@ use axum::{
     extract::{MatchedPath, Request, State},
     http::{
         header::{HeaderName, CONTENT_LENGTH},
-        HeaderValue,
+        HeaderMap, HeaderValue,
     },
     middleware::Next,
     response::Response,
+    Json,
 };
-use axum::{http::StatusCode, response::IntoResponse};
+use axum::{
+    http::{header::CONTENT_TYPE, StatusCode},
+    response::IntoResponse,
+};
+use http_body::{Body as HttpBody, Frame};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
+use mistralrs_core::REQUEST_QUEUE_DURATION_METRIC;
+use std::error::Error as _;
+use std::pin::Pin;
 use std::sync::OnceLock;
+use std::task::{Context, Poll};
 use std::time::Instant;
 use tracing::{debug, info};
 
 use crate::{
+    handler_core::{openai_error_response, ApiError, ApiErrorKind, ResponseErrorMessage},
     lora_adapters::{
         is_resolvable_lora_adapter_model, lifecycle_body_too_large_response,
         list_lora_adapter_models,
     },
     mistralrs_server_router_builder::DEFAULT_MAX_BODY_LIMIT,
+    streaming::{StreamOutcome, StreamOutcomeHandle},
     types::SharedMistralRsState,
 };
 
 static PROMETHEUS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 const REQUEST_ID_HEADER: &str = "x-request-id";
+const ANTHROPIC_REQUEST_ID_HEADER: &str = "request-id";
 const UNMATCHED_ROUTE: &str = "<unmatched>";
 const NO_MODEL: &str = "none";
 const UNKNOWN_MODEL: &str = "unknown";
 const DEFAULT_MODEL: &str = "default";
 const OPTIONS_METHOD: &str = "OPTIONS";
+const SSE_CONTENT_TYPE: &str = "text/event-stream";
+// Error bodies are small; cap what we buffer to recover a message for the access log
+const MAX_LOGGED_ERROR_BODY_BYTES: usize = 4 * 1024;
 const MILLIS_PER_SECOND: f64 = 1_000.0;
 const ACCESS_LOG_MS_ROUNDING: f64 = 1_000.0;
 const HTTP_REQUEST_DURATION_BUCKETS: [f64; 18] = [
@@ -51,6 +66,22 @@ const HTTP_REQUEST_BODY_BYTE_BUCKETS: [f64; 12] = [
     52_428_800.0,
     104_857_600.0,
 ];
+// Bucket lists taken from vLLM's Prometheus exporter
+const TTFT_BUCKETS: [f64; 22] = [
+    0.001, 0.005, 0.01, 0.02, 0.04, 0.06, 0.08, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0,
+    20.0, 40.0, 80.0, 160.0, 640.0, 2_560.0,
+];
+const ITL_BUCKETS: [f64; 19] = [
+    0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0, 20.0,
+    40.0, 80.0,
+];
+const QUEUE_DURATION_BUCKETS: [f64; 22] = [
+    0.001, 0.005, 0.01, 0.02, 0.04, 0.06, 0.08, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0,
+    20.0, 40.0, 80.0, 160.0, 640.0, 2_560.0,
+];
+pub(crate) const TTFT_METRIC: &str = "mistralrs_time_to_first_token_seconds";
+pub(crate) const ITL_METRIC: &str = "mistralrs_inter_token_latency_seconds";
+const REQUEST_OUTCOME_METRIC: &str = "mistralrs_request_outcomes_total";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -131,6 +162,15 @@ pub fn install_prometheus_recorder() {
             &HTTP_REQUEST_BODY_BYTE_BUCKETS,
         )
         .expect("valid HTTP request body byte buckets")
+        .set_buckets_for_metric(Matcher::Full(TTFT_METRIC.to_string()), &TTFT_BUCKETS)
+        .expect("valid TTFT buckets")
+        .set_buckets_for_metric(Matcher::Full(ITL_METRIC.to_string()), &ITL_BUCKETS)
+        .expect("valid ITL buckets")
+        .set_buckets_for_metric(
+            Matcher::Full(REQUEST_QUEUE_DURATION_METRIC.to_string()),
+            &QUEUE_DURATION_BUCKETS,
+        )
+        .expect("valid request queue duration buckets")
         .install_recorder()
         .expect("failed to install Prometheus recorder");
     let _ = PROMETHEUS_HANDLE.set(handle);
@@ -185,6 +225,8 @@ pub async fn observe_http(
         .map(|m| m.as_str().to_string())
         .unwrap_or_else(|| UNMATCHED_ROUTE.to_string());
     let uri_path = req.uri().path().to_string();
+    let anthropic_request =
+        is_anthropic_request(&route, &uri_path, req.headers(), req.uri().query());
     let content_length_header = req
         .headers()
         .get(CONTENT_LENGTH)
@@ -192,7 +234,7 @@ pub async fn observe_http(
         .and_then(|value| value.parse::<u64>().ok());
     let request_id = request_id(&mut req);
     let (req, model, body_bytes, early_response) =
-        match extract_model(req, &route, &observability).await {
+        match extract_model(req, &route, &request_id, &observability).await {
             Ok((req, model, body_bytes)) => (Some(req), model, body_bytes, None),
             Err(response) => (None, UNKNOWN_MODEL.to_string(), None, Some(response)),
         };
@@ -227,14 +269,21 @@ pub async fn observe_http(
         None
     };
 
+    let outcome_handle = StreamOutcomeHandle::default();
     let mut response = match early_response {
         Some(response) => response,
         None => {
-            next.run(req.expect("request exists without early response"))
-                .await
+            let mut req = req.expect("request exists without early response");
+            req.extensions_mut().insert(outcome_handle.clone());
+            next.run(req).await
         }
     };
-    let latency = start.elapsed().as_secs_f64();
+    if anthropic_request
+        && (response.status().is_client_error() || response.status().is_server_error())
+        && !is_sse(&response)
+    {
+        response = insert_anthropic_request_id(response, &request_id).await;
+    }
     let status = response.status().as_u16().to_string();
 
     if config.request_id_header {
@@ -244,40 +293,267 @@ pub async fn observe_http(
                 .insert(HeaderName::from_static(REQUEST_ID_HEADER), value);
         }
     }
-
-    if config.metrics && !housekeeping {
-        drop(in_flight);
-        let labels = [
-            ("method", method.clone()),
-            ("path", route.clone()),
-            ("model", model.clone()),
-            ("status", status.clone()),
-        ];
-        metrics::counter!("http_requests_total", &labels).increment(1);
-        metrics::histogram!("http_request_duration_seconds", &labels).record(latency);
-    } else {
-        drop(in_flight);
+    if anthropic_request {
+        if let Ok(value) = HeaderValue::from_str(&request_id) {
+            response
+                .headers_mut()
+                .insert(HeaderName::from_static(ANTHROPIC_REQUEST_ID_HEADER), value);
+        }
     }
 
-    if log_access {
-        log_request_done(
-            config.access_log_format,
-            &request_id,
-            &method,
-            &route,
-            &model,
-            &status,
-            latency,
-        );
-    } else {
-        let duration_ms = rounded_duration_ms(latency);
-        debug!(
-            "request completed: request_id={} method={} route={} model={} status={} duration_ms={:.3}",
-            request_id, method, route, model, status, duration_ms
-        );
+    let completion = RequestCompletion {
+        config,
+        request_id,
+        method,
+        route,
+        model,
+        status,
+        start,
+        housekeeping,
+        log_access,
+        in_flight,
+    };
+
+    // SSE bodies keep working long after the handler returns; finish accounting when the body ends
+    if is_sse(&response) {
+        completion.log_stream_accepted();
+        // Labels and start are fixed here; the streamer is only polled once this body is consumed
+        if completion.config.metrics {
+            outcome_handle.set_latency_labels(
+                [
+                    ("method", completion.method.clone()),
+                    ("path", completion.route.clone()),
+                    ("model", completion.model.clone()),
+                    ("status", completion.status.clone()),
+                ],
+                completion.start,
+            );
+        }
+        let (parts, body) = response.into_parts();
+        let body = Body::new(ObservedBody {
+            inner: body,
+            completion: Some(completion),
+            outcome: outcome_handle,
+            ended: false,
+        });
+        return Response::from_parts(parts, body);
     }
 
+    let error = if response.status().is_client_error() || response.status().is_server_error() {
+        match response.extensions().get::<ResponseErrorMessage>() {
+            Some(ResponseErrorMessage(message)) => Some(message.clone()),
+            None => {
+                let (parts, body) = response.into_parts();
+                let (message, body) = match to_bytes(body, MAX_LOGGED_ERROR_BODY_BYTES).await {
+                    Ok(bytes) => (error_message_from_body(&bytes), Body::from(bytes)),
+                    Err(_) => (None, Body::empty()),
+                };
+                response = Response::from_parts(parts, body);
+                message
+            }
+        }
+    } else {
+        None
+    };
+    completion.finish(error.map(RequestError::Message));
     response
+}
+
+/// Axum rejections and our JSON errors carry the message as `{"message": ...}` or raw text.
+fn error_message_from_body(bytes: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(bytes).ok()?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let message = serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("message")
+                .or_else(|| value.get("error").and_then(|e| e.get("message")))
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| text.to_string());
+    Some(message)
+}
+
+fn is_sse(response: &Response) -> bool {
+    response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with(SSE_CONTENT_TYPE))
+}
+
+/// Everything needed to emit the "request completed" line and metrics once, whenever the request truly ends.
+struct RequestCompletion {
+    config: ObservabilityConfig,
+    request_id: String,
+    method: String,
+    route: String,
+    model: String,
+    status: String,
+    start: Instant,
+    housekeeping: bool,
+    log_access: bool,
+    in_flight: Option<InFlightGuard>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamEnd {
+    Completed,
+    Error,
+    ClientDisconnected,
+}
+
+impl StreamEnd {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Error => "error",
+            Self::ClientDisconnected => "client_disconnected",
+        }
+    }
+}
+
+fn request_outcome(status: &str, detail: Option<&RequestError>) -> &'static str {
+    match detail {
+        Some(RequestError::Stream(stats)) => stats.end.as_str(),
+        Some(RequestError::Message(_)) => "error",
+        None if status.starts_with('4') || status.starts_with('5') => "error",
+        None => "completed",
+    }
+}
+
+struct StreamStats {
+    end: StreamEnd,
+    outcome: StreamOutcome,
+}
+
+enum RequestError {
+    Message(String),
+    Stream(StreamStats),
+}
+
+impl RequestCompletion {
+    fn log_stream_accepted(&self) {
+        debug!(
+            "stream accepted: request_id={} method={} route={} model={} status={} accepted_ms={:.3}",
+            self.request_id,
+            self.method,
+            self.route,
+            self.model,
+            self.status,
+            rounded_duration_ms(self.start.elapsed().as_secs_f64())
+        );
+    }
+
+    fn finish(self, detail: Option<RequestError>) {
+        let latency = self.start.elapsed().as_secs_f64();
+        if self.config.metrics && !self.housekeeping {
+            let labels = [
+                ("method", self.method.clone()),
+                ("path", self.route.clone()),
+                ("model", self.model.clone()),
+                ("status", self.status.clone()),
+            ];
+            metrics::counter!("http_requests_total", &labels).increment(1);
+            metrics::histogram!("http_request_duration_seconds", &labels).record(latency);
+            metrics::counter!(
+                REQUEST_OUTCOME_METRIC,
+                "outcome" => request_outcome(&self.status, detail.as_ref())
+            )
+            .increment(1);
+        }
+        drop(self.in_flight);
+
+        if self.log_access {
+            log_request_done(
+                self.config.access_log_format,
+                &self.request_id,
+                &self.method,
+                &self.route,
+                &self.model,
+                &self.status,
+                latency,
+                detail.as_ref(),
+            );
+        } else {
+            debug!(
+                "request completed: request_id={} method={} route={} model={} status={} duration_ms={:.3}",
+                self.request_id,
+                self.method,
+                self.route,
+                self.model,
+                self.status,
+                rounded_duration_ms(latency)
+            );
+        }
+    }
+}
+
+/// Wraps an SSE body so request accounting fires when the stream ends or the client goes away.
+struct ObservedBody {
+    inner: Body,
+    completion: Option<RequestCompletion>,
+    outcome: StreamOutcomeHandle,
+    ended: bool,
+}
+
+impl ObservedBody {
+    fn finish(&mut self, end: StreamEnd) {
+        if let Some(completion) = self.completion.take() {
+            let outcome = self.outcome.snapshot();
+            let end = if outcome.error.is_some() {
+                StreamEnd::Error
+            } else {
+                end
+            };
+            completion.finish(Some(RequestError::Stream(StreamStats { end, outcome })));
+        }
+    }
+}
+
+impl HttpBody for ObservedBody {
+    type Data = axum::body::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = &mut *self;
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(None) => {
+                this.ended = true;
+                this.finish(StreamEnd::Completed);
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(err))) => {
+                this.ended = true;
+                this.finish(StreamEnd::Error);
+                Poll::Ready(Some(Err(err)))
+            }
+            other => other,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl Drop for ObservedBody {
+    fn drop(&mut self) {
+        if !self.ended {
+            self.finish(StreamEnd::ClientDisconnected);
+        }
+    }
 }
 
 fn request_id(req: &mut Request) -> String {
@@ -295,9 +571,11 @@ fn request_id(req: &mut Request) -> String {
 #[derive(Clone, Debug)]
 pub struct RequestId(pub String);
 
+#[allow(clippy::result_large_err)]
 async fn extract_model(
     req: Request,
     route: &str,
+    request_id: &str,
     observability: &ObservabilityState,
 ) -> Result<(Request, String, Option<u64>), Response> {
     let Some(field) = model_label_field(route) else {
@@ -316,7 +594,17 @@ async fn extract_model(
     let (parts, body) = req.into_parts();
     let bytes = to_bytes(body, observability.max_body_bytes)
         .await
-        .map_err(|_| body_too_large_response(route))?;
+        .map_err(|error| {
+            if error
+                .source()
+                .is_some_and(|source| source.is::<http_body_util::LengthLimitError>())
+            {
+                body_too_large_response(route, Some(request_id))
+            } else {
+                debug!(%error, route, "failed to read request body");
+                body_read_error_response(route, Some(request_id))
+            }
+        })?;
     let body_bytes = Some(bytes.len() as u64);
     let model = match serde_json::from_slice::<serde_json::Value>(&bytes) {
         Ok(value) => resolve_model_label(&value, field, observability),
@@ -329,12 +617,107 @@ async fn extract_model(
     ))
 }
 
-fn body_too_large_response(route: &str) -> Response {
+fn body_too_large_response(route: &str, request_id: Option<&str>) -> Response {
     if matches!(route, "/v1/load_lora_adapter" | "/v1/unload_lora_adapter") {
         lifecycle_body_too_large_response()
+    } else if is_anthropic_route(route) {
+        let mut response = Json(serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "request_too_large",
+                "message": "Request body too large.",
+            },
+            "request_id": request_id,
+        }))
+        .into_response();
+        *response.status_mut() = StatusCode::PAYLOAD_TOO_LARGE;
+        response
     } else {
-        (StatusCode::PAYLOAD_TOO_LARGE, "request body too large").into_response()
+        openai_error_response(ApiError::new(
+            ApiErrorKind::PayloadTooLarge,
+            "Request body too large.",
+            Some("request_body_too_large"),
+            None,
+        ))
     }
+}
+
+fn body_read_error_response(route: &str, request_id: Option<&str>) -> Response {
+    if is_anthropic_route(route) {
+        let mut response = Json(serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "Failed to read request body.",
+            },
+            "request_id": request_id,
+        }))
+        .into_response();
+        *response.status_mut() = StatusCode::BAD_REQUEST;
+        response
+    } else {
+        openai_error_response(ApiError::new(
+            ApiErrorKind::InvalidRequest,
+            "Failed to read request body.",
+            Some("invalid_request_body"),
+            None,
+        ))
+    }
+}
+
+fn is_anthropic_route(route: &str) -> bool {
+    matches!(route, "/v1/messages" | "/v1/messages/count_tokens")
+}
+
+fn is_anthropic_request(
+    route: &str,
+    uri_path: &str,
+    headers: &HeaderMap,
+    query: Option<&str>,
+) -> bool {
+    if is_anthropic_route(route) || path_is_in_namespace(uri_path, "/v1/messages") {
+        return true;
+    }
+    if !path_is_in_namespace(uri_path, "/v1/skills") {
+        return false;
+    }
+    headers.contains_key("anthropic-version")
+        || headers.contains_key("anthropic-beta")
+        || query.is_some_and(|query| {
+            url::form_urlencoded::parse(query.as_bytes()).any(|(key, _)| key == "source")
+        })
+}
+
+fn path_is_in_namespace(path: &str, namespace: &str) -> bool {
+    path == namespace
+        || path
+            .strip_prefix(namespace)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+async fn insert_anthropic_request_id(response: Response, request_id: &str) -> Response {
+    let (mut parts, body) = response.into_parts();
+    let bytes = match to_bytes(body, usize::MAX).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            debug!(%error, "failed to add request_id to Anthropic error body");
+            return Response::from_parts(parts, Body::empty());
+        }
+    };
+    let mut value = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(value) => value,
+        Err(_) => return Response::from_parts(parts, Body::from(bytes)),
+    };
+    let Some(object) = value.as_object_mut() else {
+        return Response::from_parts(parts, Body::from(bytes));
+    };
+    object.insert(
+        "request_id".to_string(),
+        serde_json::Value::String(request_id.to_string()),
+    );
+    let bytes = serde_json::to_vec(&value).expect("JSON value serialization cannot fail");
+    parts.headers.remove(CONTENT_LENGTH);
+    Response::from_parts(parts, Body::from(bytes))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -513,6 +896,7 @@ fn log_request_start(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn log_request_done(
     format: AccessLogFormat,
     request_id: &str,
@@ -521,16 +905,44 @@ fn log_request_done(
     model: &str,
     status: &str,
     latency: f64,
+    detail: Option<&RequestError>,
 ) {
     let duration_ms = rounded_duration_ms(latency);
+    let stream = match detail {
+        Some(RequestError::Stream(stats)) => Some(stats),
+        _ => None,
+    };
+    let usage = stream.and_then(|stats| stats.outcome.usage.as_ref());
+    let error = match detail {
+        Some(RequestError::Message(message)) => Some(message.as_str()),
+        Some(RequestError::Stream(stats)) => stats.outcome.error.as_deref(),
+        None => None,
+    };
     match format {
-        AccessLogFormat::Text => info!(
-            "request completed: request_id={} method={} route={} model={} status={} duration_ms={:.3}",
-            request_id, method, route, model, status, duration_ms
-        ),
-        AccessLogFormat::Json => info!(
-            "{}",
-            serde_json::json!({
+        AccessLogFormat::Text => {
+            let mut line = format!(
+                "request completed: request_id={request_id} method={method} route={route} model={model} status={status}"
+            );
+            if let Some(stats) = stream {
+                line.push_str(&format!(" outcome={}", stats.end.as_str()));
+            }
+            line.push_str(&format!(" duration_ms={duration_ms:.3}"));
+            if let Some(usage) = usage {
+                line.push_str(&format!(
+                    " prompt_tokens={} completion_tokens={} prefill_tok_s={:.1} decode_tok_s={:.1}",
+                    usage.prompt_tokens,
+                    usage.completion_tokens,
+                    usage.avg_prompt_tok_per_sec,
+                    usage.avg_compl_tok_per_sec
+                ));
+            }
+            if let Some(error) = error {
+                line.push_str(&format!(" error={error:?}"));
+            }
+            info!("{line}");
+        }
+        AccessLogFormat::Json => {
+            let mut record = serde_json::json!({
                 "event": "request_completed",
                 "request_id": request_id,
                 "method": method,
@@ -538,8 +950,21 @@ fn log_request_done(
                 "model": model,
                 "status": status,
                 "duration_ms": duration_ms,
-            })
-        ),
+            });
+            if let Some(stats) = stream {
+                record["outcome"] = serde_json::Value::String(stats.end.as_str().to_string());
+            }
+            if let Some(usage) = usage {
+                record["prompt_tokens"] = usage.prompt_tokens.into();
+                record["completion_tokens"] = usage.completion_tokens.into();
+                record["prefill_tok_s"] = usage.avg_prompt_tok_per_sec.into();
+                record["decode_tok_s"] = usage.avg_compl_tok_per_sec.into();
+            }
+            if let Some(error) = error {
+                record["error"] = serde_json::Value::String(error.to_string());
+            }
+            info!("{record}");
+        }
     }
 }
 
@@ -551,11 +976,16 @@ fn rounded_duration_ms(latency_seconds: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        adapter_model_label_is_known, body_too_large_response, model_label_field,
-        normalize_model_label_input, query_model, ModelLabelField,
+        adapter_model_label_is_known, body_too_large_response, is_anthropic_request,
+        model_label_field, normalize_model_label_input, query_model, request_outcome,
+        ModelLabelField, RequestError, StreamEnd, StreamStats,
     };
-    use crate::lora_adapters::LoraAdapterModel;
-    use axum::body::to_bytes;
+    use crate::{lora_adapters::LoraAdapterModel, streaming::StreamOutcome};
+    use axum::{
+        body::to_bytes,
+        http::{HeaderMap, HeaderValue, StatusCode},
+        response::IntoResponse,
+    };
     use mistralrs_core::{AdapterGenerationId, LoraAdapterInfo};
 
     fn adapter_model(id: &str, parent: &str, alias: &str) -> LoraAdapterModel {
@@ -570,6 +1000,27 @@ mod tests {
                 rank: 8,
                 bytes: 16,
             },
+        }
+    }
+
+    #[test]
+    fn request_outcomes_are_bounded_and_distinguish_disconnects() {
+        assert_eq!(request_outcome("200", None), "completed");
+        assert_eq!(request_outcome("503", None), "error");
+        assert_eq!(
+            request_outcome("200", Some(&RequestError::Message("failed".to_string()))),
+            "error"
+        );
+        for (end, expected) in [
+            (StreamEnd::Completed, "completed"),
+            (StreamEnd::Error, "error"),
+            (StreamEnd::ClientDisconnected, "client_disconnected"),
+        ] {
+            let detail = RequestError::Stream(StreamStats {
+                end,
+                outcome: StreamOutcome::default(),
+            });
+            assert_eq!(request_outcome("200", Some(&detail)), expected);
         }
     }
 
@@ -615,6 +1066,49 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_anthropic_skill_requests() {
+        let mut headers = HeaderMap::new();
+        assert!(is_anthropic_request(
+            "/v1/messages",
+            "/v1/messages",
+            &headers,
+            None,
+        ));
+        assert!(is_anthropic_request(
+            "<unmatched>",
+            "/v1/messages/unknown",
+            &headers,
+            None,
+        ));
+        assert!(!is_anthropic_request(
+            "/v1/skills",
+            "/v1/skills",
+            &headers,
+            None,
+        ));
+        assert!(is_anthropic_request(
+            "/v1/skills",
+            "/v1/skills",
+            &headers,
+            Some("source=custom"),
+        ));
+
+        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        assert!(is_anthropic_request(
+            "/v1/skills/{skill_id}/versions",
+            "/v1/skills/skill_1/versions",
+            &headers,
+            None,
+        ));
+        assert!(!is_anthropic_request(
+            "<unmatched>",
+            "/v1/skills-extra",
+            &headers,
+            None,
+        ));
+    }
+
+    #[test]
     fn adapter_model_labels_are_bounded_by_resolvable_cards() {
         let models = vec![
             adapter_model("base-a::code", "base-a", "code"),
@@ -633,11 +1127,48 @@ mod tests {
 
     #[tokio::test]
     async fn lifecycle_body_limit_uses_the_lora_error_envelope() {
-        let response = body_too_large_response("/v1/load_lora_adapter");
+        let response = body_too_large_response("/v1/load_lora_adapter", None);
         assert_eq!(response.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["error"]["code"], "request_body_too_large");
         assert_eq!(value["error"]["type"], "invalid_request_error");
+    }
+
+    #[tokio::test]
+    async fn inference_body_limits_use_protocol_error_envelopes() {
+        let response = body_too_large_response("/v1/chat/completions", None);
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], "request_body_too_large");
+        assert_eq!(value["error"]["type"], "invalid_request_error");
+
+        let response = body_too_large_response("/v1/messages", Some("req_test"));
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["type"], "error");
+        assert_eq!(value["error"]["type"], "request_too_large");
+        assert_eq!(value["request_id"], "req_test");
+    }
+
+    #[tokio::test]
+    async fn adds_request_id_to_anthropic_error_bodies() {
+        let response = (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "Invalid request.",
+                }
+            })),
+        )
+            .into_response();
+        let response = super::insert_anthropic_request_id(response, "req_test").await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["request_id"], "req_test");
     }
 }

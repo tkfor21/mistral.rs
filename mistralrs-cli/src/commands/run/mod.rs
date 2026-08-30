@@ -6,6 +6,7 @@ use interactive::OneshotInput;
 pub(crate) use interactive::{interactive_mode, InteractiveConfig};
 
 use anyhow::Result;
+use mistralrs_core::{resolve_reasoning_controls, ReasoningEffort};
 use tracing::info;
 
 use mistralrs_core::initialize_logging;
@@ -14,8 +15,9 @@ use mistralrs_server_core::mistralrs_for_server_builder::MistralRsForServerBuild
 use super::normalize_requested_adapter;
 use super::serve::{
     apply_agent_mode, apply_quant_resolution, convert_to_model_selected, extract_device_settings,
-    extract_isq_setting, extract_paged_attn_settings, extract_sandbox_settings, load_mcp_config,
-    log_agent_runtime, validate_agent_options,
+    extract_encoder_cache_memory_bytes, extract_hf_config_settings, extract_isq_setting,
+    extract_paged_attn_settings, extract_sandbox_settings, load_mcp_config, log_agent_runtime,
+    validate_agent_options,
 };
 #[cfg(feature = "code-execution")]
 use super::serve::{build_code_exec_config, build_shell_config};
@@ -30,6 +32,7 @@ pub async fn run_interactive(
     sandbox: SandboxOptions,
     global: GlobalOptions,
     thinking: Option<bool>,
+    reasoning_effort: Option<ReasoningEffort>,
     input: Option<String>,
     images: Vec<String>,
     videos: Vec<String>,
@@ -37,6 +40,7 @@ pub async fn run_interactive(
     request_adapter: Option<String>,
 ) -> Result<()> {
     initialize_logging();
+    resolve_reasoning_controls(thinking, reasoning_effort)?;
 
     let request_adapter = normalize_requested_adapter(&model_type, request_adapter.as_deref())?;
 
@@ -49,6 +53,7 @@ pub async fn run_interactive(
     let matformer = runtime.matformer_selection();
     apply_quant_resolution(&mut model_type, &global.token_source, &matformer).await?;
     let model_selected = convert_to_model_selected(&model_type, &matformer)?;
+    let (max_model_len, hf_config_overrides) = extract_hf_config_settings(&model_type);
 
     // Extract settings
     let (
@@ -61,11 +66,15 @@ pub async fn run_interactive(
     ) = extract_paged_attn_settings(&model_type);
     let (cpu, device_layers) = extract_device_settings(&model_type);
     let isq = extract_isq_setting(&model_type);
+    let encoder_cache_memory_bytes = extract_encoder_cache_memory_bytes(&model_type)?;
 
     // Build the MistralRs instance
     let mut builder = MistralRsForServerBuilder::new()
         .with_model(model_selected)
         .with_max_seqs(runtime.max_seqs)
+        .with_max_num_batched_tokens(runtime.max_num_batched_tokens)
+        .with_max_prefill_chunk_tokens(runtime.max_prefill_chunk_tokens)
+        .with_max_decode_steps_before_prefill(runtime.max_decode_steps_before_prefill)
         .with_no_kv_cache(runtime.no_kv_cache)
         .with_token_source(global.token_source)
         .with_interactive_mode(true)
@@ -94,7 +103,13 @@ pub async fn run_interactive(
         .with_paged_ctxt_len_optional(paged_ctxt_len)
         .with_paged_attn_block_size_optional(paged_attn_block_size)
         .with_mtp_config_optional(runtime.mtp_config())
+        .with_max_model_len_optional(max_model_len)
+        .with_hf_config_overrides_optional(hf_config_overrides)
         .with_paged_attn_cache_type(paged_cache_type);
+
+    if let Some(max_bytes) = encoder_cache_memory_bytes {
+        builder = builder.with_encoder_cache_memory_bytes(max_bytes);
+    }
 
     if let Some(model) = runtime.search_embedding_model {
         builder = builder.with_search_embedding_model(model.into());
@@ -149,6 +164,7 @@ pub async fn run_interactive(
                 do_shell,
                 agent_permission: runtime.code_exec_permission.into(),
                 enable_thinking: thinking,
+                reasoning_effort,
                 adapter: request_adapter,
             },
         )
@@ -172,6 +188,7 @@ pub async fn run_interactive(
                 do_shell,
                 agent_permission: runtime.code_exec_permission.into(),
                 enable_thinking: thinking,
+                reasoning_effort,
                 adapter: request_adapter,
             },
         )

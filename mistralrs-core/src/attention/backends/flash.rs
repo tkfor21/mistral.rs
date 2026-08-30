@@ -22,8 +22,14 @@ pub(crate) fn flash_backend_supports_sdpa(
     has_softcap: bool,
     has_sliding_window: bool,
 ) -> bool {
-    flash_backend_supports(head_dim, has_softcap)
-        && !(cfg!(feature = "flash-attn") && head_dim > 256 && has_sliding_window)
+    if !flash_backend_supports(head_dim, has_softcap) {
+        return false;
+    }
+    if !has_sliding_window {
+        return true;
+    }
+    // v3 never sets is_local, so without v2 to fall back to a sliding window has to go eager.
+    cfg!(feature = "flash-attn") && head_dim <= 256
 }
 
 #[cfg(any(feature = "flash-attn", feature = "flash-attn-v3"))]
@@ -217,14 +223,23 @@ pub(crate) fn flash_attn(
             sdpa_params.softcap.is_some()
         );
     }
-    if head_dim <= 512 {
-        #[cfg(feature = "flash-attn")]
-        {
-            return flash_attn_v2(q, k, v, flash_params, sdpa_params);
-        }
+    // v3 wins on single-sequence prefill and ties elsewhere, so it takes the head dims it supports.
+    // v3 never sets is_local, so its sliding window is a no-op; leave those to v2.
+    if matches!(head_dim, 64 | 128 | 256 | 512)
+        && sdpa_params.softcap.is_none()
+        && sdpa_params.sliding_window.is_none()
+    {
+        return flash_attn_v3(q, k, v, flash_params, sdpa_params);
     }
 
-    flash_attn_v3(q, k, v, flash_params, sdpa_params)
+    #[cfg(feature = "flash-attn")]
+    {
+        flash_attn_v2(q, k, v, flash_params, sdpa_params)
+    }
+    #[cfg(not(feature = "flash-attn"))]
+    {
+        flash_attn_v3(q, k, v, flash_params, sdpa_params)
+    }
 }
 
 #[cfg(all(feature = "flash-attn", not(feature = "flash-attn-v3")))]

@@ -24,6 +24,7 @@ use crate::{
     pipeline::{
         EitherCache, IsqModel, ModelForwardContext, MultimodalModel, NormalLoadingMetadata,
     },
+    utils::unvarbuilder::UnVarBuilder,
     vision_models::multimodal_layout::{
         gather_packed_mrope_positions, MropePositionSource, MultimodalEncoderKey,
         MultimodalEncoderOutputs, PackedMultimodalLayout,
@@ -37,14 +38,16 @@ mod vision;
 
 pub(crate) use config::Config;
 pub(crate) use inputs_processor::{
-    expand_media_placeholders, media_data_cached_offset, packed_layout, prompt_mrope,
-    select_media_batch, select_media_view, shift_media_spans, split_media_pixels,
-    validated_mm_features, video_hashes, PromptMropeConfig, Qwen2VLProcessor,
+    apply_mrope_position_deltas, expand_media_placeholders, media_data_cached_offset,
+    packed_layout, prompt_mrope, replace_first_occurrence, select_media_batch, select_media_view,
+    shift_media_spans, split_media_pixels, validate_qwen_media_dimensions, validated_mm_features,
+    video_hashes, PromptMropeConfig, Qwen2VLProcessor,
 };
 
 pub struct Qwen2VLModel {
     text: Qwen2VLTextModel,
     vision: Qwen2VLVisionModel,
+    vision_prefix: &'static str,
     spatial_merge_size: usize,
     image_token_id: u32,
     video_token_id: u32,
@@ -78,11 +81,13 @@ impl Qwen2VLModel {
         normal_loading_metadata: NormalLoadingMetadata,
         attention_mechanism: AttentionImplementation,
     ) -> Result<Self> {
-        let vision_vb = if vb.contains_tensor("vision_tower.patch_embed.proj.weight") {
-            vb.pp("vision_tower")
-        } else {
-            vb.pp("visual")
-        };
+        let (vision_vb, vision_prefix) =
+            if vb.contains_tensor("vision_tower.patch_embed.proj.weight") {
+                (vb.pp("vision_tower"), "vision_tower")
+            } else {
+                (vb.pp("visual"), "visual")
+            };
+        let vision_vb = vision_vb.without_lora_registry();
         let vision = Qwen2VLVisionModel::new(
             &cfg.vision_config,
             vision_vb.set_device(normal_loading_metadata.real_device.clone()),
@@ -98,6 +103,7 @@ impl Qwen2VLModel {
         Ok(Self {
             text,
             vision,
+            vision_prefix,
             spatial_merge_size: cfg.vision_config.spatial_merge_size,
             image_token_id: cfg.image_token_id,
             video_token_id: cfg.video_token_id,
@@ -457,8 +463,15 @@ impl Qwen2VLModel {
             self.text.embed_tokens(input_ids)?
         };
 
+        let decode_position_ids = if rope_img_grid_thw.is_none() && rope_vid_grid_thw.is_none() {
+            crate::vision_models::text_decode_mrope_position_ids_from_context(input_ids, ctx)?
+        } else {
+            None
+        };
         let position_ids = if let Some(position_ids) = prompt_position_ids {
             position_ids.clone()
+        } else if let Some(position_ids) = decode_position_ids {
+            position_ids
         } else {
             let mut ropeidx_attn_mask_bs = Vec::new();
             let max_seqlens = *seqlens.iter().max().unwrap();
@@ -629,6 +642,9 @@ impl MultimodalModel for Qwen2VLModel {
             prompt_position_ids: None,
         })
     }
+    fn encoder_cache(&self) -> Option<&Mutex<EncoderCacheManager>> {
+        Some(&self.encoder_cache)
+    }
     fn encoder_cache_counters(
         &self,
     ) -> Option<(
@@ -646,7 +662,11 @@ impl MultimodalModel for Qwen2VLModel {
 
 impl IsqModel for Qwen2VLModel {
     fn residual_tensors(&self) -> Vec<(String, Tensor)> {
-        self.text.residual_tensors()
+        let uvb = UnVarBuilder::new();
+        uvb.extend(self.text.residual_tensors());
+        uvb.pp(self.vision_prefix)
+            .extend(self.vision.residual_tensors());
+        uvb.to_safetensors()
     }
 }
 

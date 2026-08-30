@@ -9,7 +9,7 @@
     "license": {
       "name": "MIT"
     },
-    "version": "0.9.0"
+    "version": "0.9.2"
   },
   "paths": {
     "/calibration/apply": {
@@ -133,7 +133,13 @@
         },
         "responses": {
           "200": {
-            "description": "Reapply ISQ to a non GGUF or GGML model."
+            "description": "Reapply ISQ to a model that was loaded with ISQ."
+          },
+          "400": {
+            "description": "Invalid ISQ type"
+          },
+          "500": {
+            "description": "Failed to dispatch the ISQ request"
           }
         }
       }
@@ -176,15 +182,17 @@
               }
             }
           },
+          "400": {
+            "description": "Invalid decision payload"
+          },
           "404": {
-            "description": "Unknown approval ID",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApprovalDecisionResponse"
-                }
-              }
-            }
+            "description": "Unknown approval ID"
+          },
+          "413": {
+            "description": "Decision payload is too large"
+          },
+          "415": {
+            "description": "Unsupported content type"
           }
         }
       }
@@ -315,6 +323,9 @@
                 }
               }
             }
+          },
+          "500": {
+            "description": "Internal server error"
           }
         }
       }
@@ -358,6 +369,9 @@
           },
           "404": {
             "description": "File not found or expired"
+          },
+          "500": {
+            "description": "Internal server error"
           }
         }
       }
@@ -397,6 +411,9 @@
           },
           "410": {
             "description": "File body was elided and is no longer fetchable"
+          },
+          "500": {
+            "description": "Internal server error"
           }
         }
       }
@@ -450,6 +467,9 @@
                 }
               }
             }
+          },
+          "500": {
+            "description": "Internal server error"
           }
         }
       },
@@ -510,6 +530,9 @@
           },
           "404": {
             "description": "File not found or expired"
+          },
+          "500": {
+            "description": "Internal server error"
           }
         }
       },
@@ -535,6 +558,9 @@
           },
           "404": {
             "description": "File not found or expired"
+          },
+          "500": {
+            "description": "Internal server error"
           }
         }
       }
@@ -565,6 +591,9 @@
           },
           "410": {
             "description": "File body was elided and is no longer fetchable"
+          },
+          "500": {
+            "description": "Internal server error"
           }
         }
       }
@@ -677,16 +706,6 @@
           },
           "415": {
             "description": "Request content type is not JSON",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/LoraAdapterErrorResponse"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Adapter files are invalid or unsupported",
             "content": {
               "application/json": {
                 "schema": {
@@ -875,6 +894,9 @@
                 }
               }
             }
+          },
+          "500": {
+            "description": "Failed to inspect the model registry"
           }
         }
       }
@@ -897,7 +919,7 @@
         },
         "responses": {
           "200": {
-            "description": "Model reloaded successfully",
+            "description": "Model reloaded or already loaded",
             "content": {
               "application/json": {
                 "schema": {
@@ -907,14 +929,22 @@
             }
           },
           "400": {
-            "description": "Failed to reload model",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ModelStatusResponse"
-                }
-              }
-            }
+            "description": "Invalid request or model cannot be reloaded"
+          },
+          "404": {
+            "description": "Model not found"
+          },
+          "409": {
+            "description": "Model state conflicts with the operation"
+          },
+          "413": {
+            "description": "Request body is too large"
+          },
+          "415": {
+            "description": "Request content type is not JSON"
+          },
+          "500": {
+            "description": "Model reload failure"
           }
         }
       }
@@ -946,15 +976,20 @@
               }
             }
           },
+          "400": {
+            "description": "Invalid request"
+          },
           "404": {
-            "description": "Model not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ModelStatusResponse"
-                }
-              }
-            }
+            "description": "Model not found"
+          },
+          "413": {
+            "description": "Request body is too large"
+          },
+          "415": {
+            "description": "Request content type is not JSON"
+          },
+          "500": {
+            "description": "Model registry failure"
           }
         }
       }
@@ -978,6 +1013,15 @@
         "responses": {
           "200": {
             "description": "Auto-tune result with recommended settings"
+          },
+          "400": {
+            "description": "Invalid tuning request"
+          },
+          "413": {
+            "description": "Request body is too large"
+          },
+          "415": {
+            "description": "Request content type is not JSON"
           },
           "500": {
             "description": "Tuning failed"
@@ -1003,7 +1047,7 @@
         },
         "responses": {
           "200": {
-            "description": "Model unloaded successfully",
+            "description": "Model unloaded or already unloaded",
             "content": {
               "application/json": {
                 "schema": {
@@ -1013,14 +1057,22 @@
             }
           },
           "400": {
-            "description": "Failed to unload model",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ModelStatusResponse"
-                }
-              }
-            }
+            "description": "Invalid request or model cannot be unloaded"
+          },
+          "404": {
+            "description": "Model not found"
+          },
+          "409": {
+            "description": "Model state conflicts with the operation"
+          },
+          "413": {
+            "description": "Request body is too large"
+          },
+          "415": {
+            "description": "Request content type is not JSON"
+          },
+          "500": {
+            "description": "Model registry failure"
           }
         }
       }
@@ -1425,16 +1477,6 @@
               }
             }
           },
-          "422": {
-            "description": "Request body is invalid",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/LoraAdapterErrorResponse"
-                }
-              }
-            }
-          },
           "500": {
             "description": "Internal server error",
             "content": {
@@ -1745,6 +1787,21 @@
           }
         }
       },
+      "AnthropicJsonOutputFormat": {
+        "type": "object",
+        "required": [
+          "type",
+          "schema"
+        ],
+        "properties": {
+          "schema": {
+            "type": "object"
+          },
+          "type": {
+            "type": "string"
+          }
+        }
+      },
       "AnthropicMessage": {
         "type": "object",
         "required": [
@@ -1895,7 +1952,8 @@
             "type": [
               "boolean",
               "null"
-            ]
+            ],
+            "description": "mistral.rs extension for toggling reasoning."
           },
           "files": {
             "type": [
@@ -1975,6 +2033,16 @@
           "model": {
             "type": "string"
           },
+          "output_config": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AnthropicOutputConfig"
+              }
+            ]
+          },
           "presence_penalty": {
             "type": [
               "number",
@@ -1983,9 +2051,14 @@
             "format": "float"
           },
           "reasoning_effort": {
-            "type": [
-              "string",
-              "null"
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ReasoningEffort",
+                "description": "mistral.rs extension for local reasoning effort. \"none\" aliases \"off\"; \"max\" aliases \"xhigh\"."
+              }
             ]
           },
           "repetition_penalty": {
@@ -2111,6 +2184,27 @@
           }
         }
       },
+      "AnthropicOutputConfig": {
+        "type": "object",
+        "properties": {
+          "effort": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "format": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AnthropicJsonOutputFormat"
+              }
+            ]
+          }
+        }
+      },
       "AnthropicResponseContentBlock": {
         "type": "object",
         "required": [
@@ -2130,6 +2224,12 @@
             ]
           },
           "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "signature": {
             "type": [
               "string",
               "null"
@@ -2316,6 +2416,12 @@
             ],
             "minimum": 0
           },
+          "display": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "type": {
             "type": "string"
           }
@@ -2406,9 +2512,19 @@
         "type": "object",
         "required": [
           "input_tokens",
+          "cache_creation_input_tokens",
+          "cache_read_input_tokens",
           "output_tokens"
         ],
         "properties": {
+          "cache_creation_input_tokens": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "cache_read_input_tokens": {
+            "type": "integer",
+            "minimum": 0
+          },
           "input_tokens": {
             "type": "integer",
             "minimum": 0
@@ -2492,7 +2608,7 @@
         "properties": {
           "status": {
             "type": "string",
-            "description": "\"resolved\", \"queued\", or \"not_found\"."
+            "description": "\"resolved\" or \"queued\"."
           }
         }
       },
@@ -2741,6 +2857,18 @@
             "description": "Permission policy for agentic tools.",
             "example": null
           },
+          "chat_template_kwargs": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "vLLM-style template variables; `enable_thinking` and `reasoning_effort` map onto the fields above.",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            },
+            "example": null
+          },
           "code_execution_permission": {
             "type": [
               "string",
@@ -2828,6 +2956,11 @@
               }
             ]
           },
+          "ignore_eos": {
+            "type": "boolean",
+            "description": "Ignore model EOS tokens while still honoring explicit stops and the token limit.",
+            "example": false
+          },
           "logit_bias": {
             "type": [
               "object",
@@ -2911,12 +3044,15 @@
             "example": null
           },
           "reasoning_effort": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Reasoning effort level for Harmony-format models (GPT-OSS).\nControls the depth of reasoning/analysis: \"low\", \"medium\", or \"high\".",
-            "example": null
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ReasoningEffort",
+                "description": "Reasoning effort level for models and templates that support it.\nValid values are \"off\", \"low\", \"medium\", \"high\", and \"xhigh\".\n\"none\" is accepted as an alias for \"off\"."
+              }
+            ]
           },
           "repetition_penalty": {
             "type": [
@@ -2937,6 +3073,16 @@
                 "description": "Force plain text or JSON-schema constrained output."
               }
             ]
+          },
+          "seed": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Seed for deterministic request-scoped sampling.",
+            "example": null,
+            "minimum": 0
           },
           "session_id": {
             "type": [
@@ -3313,6 +3459,11 @@
               }
             ]
           },
+          "ignore_eos": {
+            "type": "boolean",
+            "description": "Ignore model EOS tokens while still honoring explicit stops and the token limit.",
+            "example": false
+          },
           "logit_bias": {
             "type": [
               "object",
@@ -3389,6 +3540,16 @@
             "format": "float",
             "description": "Multiplicative repetition penalty; 1.0 disables it.",
             "example": null
+          },
+          "seed": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Seed for deterministic request-scoped sampling.",
+            "example": null,
+            "minimum": 0
           },
           "stop": {
             "oneOf": [
@@ -3581,6 +3742,16 @@
           "prompt_tokens": {
             "type": "integer",
             "minimum": 0
+          },
+          "prompt_tokens_details": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PromptTokensDetailsResponse"
+              }
+            ]
           },
           "total_completion_time_sec": {
             "type": "number",
@@ -4421,7 +4592,7 @@
       },
       "Message": {
         "type": "object",
-        "description": "Represents a single message in a conversation\n\n### Examples\n\n```ignore\nuse either::Either;\nuse mistralrs_server_core::openai::{Message, MessageContent};\n\n// User message\nlet user_msg = Message {\n    content: Some(MessageContent(Either::Left(\"What's 2+2?\".to_string()))),\n    role: \"user\".to_string(),\n    name: None,\n    tool_calls: None,\n};\n\n// System message\nlet system_msg = Message {\n    content: Some(MessageContent(Either::Left(\"You are a helpful assistant.\".to_string()))),\n    role: \"system\".to_string(),\n    name: None,\n    tool_calls: None,\n};\n```",
+        "description": "Represents a single message in a conversation\n\n### Examples\n\n```ignore\nuse either::Either;\nuse mistralrs_server_core::openai::{Message, MessageContent};\n\n// User message\nlet user_msg = Message {\n    content: Some(MessageContent(Either::Left(\"What's 2+2?\".to_string()))),\n    role: \"user\".to_string(),\n    name: None,\n    tool_calls: None,\n    tool_call_id: None,\n    reasoning_content: None,\n};\n\n// System message\nlet system_msg = Message {\n    content: Some(MessageContent(Either::Left(\"You are a helpful assistant.\".to_string()))),\n    role: \"system\".to_string(),\n    name: None,\n    tool_calls: None,\n    tool_call_id: None,\n    reasoning_content: None,\n};\n```",
         "required": [
           "role"
         ],
@@ -4443,6 +4614,13 @@
               "null"
             ],
             "description": "Optional participant name for this message"
+          },
+          "reasoning_content": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Reasoning emitted with an assistant message (`reasoning` is the OpenAI-compatible alias)."
           },
           "role": {
             "type": "string",
@@ -4611,10 +4789,7 @@
         "enum": [
           "loaded",
           "unloaded",
-          "reloading",
-          "not_found",
-          "no_loader_config",
-          "internal_error"
+          "reloading"
         ]
       },
       "ModelStatusResponse": {
@@ -4625,13 +4800,6 @@
           "status"
         ],
         "properties": {
-          "error": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Error message when status indicates an error condition"
-          },
           "model_id": {
             "type": "string",
             "example": "my-model"
@@ -4723,6 +4891,48 @@
         "type": "string",
         "enum": [
           "function"
+        ]
+      },
+      "OpenAiNamespaceEntry": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/OpenAiResponsesFunctionTool"
+          },
+          {}
+        ]
+      },
+      "OpenAiNamespaceTool": {
+        "type": "object",
+        "description": "A grouping of client-executed tools; the model sees each inner tool as `<namespace>.<name>`.",
+        "required": [
+          "type",
+          "name"
+        ],
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "tools": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OpenAiNamespaceEntry"
+            }
+          },
+          "type": {
+            "$ref": "#/components/schemas/OpenAiNamespaceToolType"
+          }
+        }
+      },
+      "OpenAiNamespaceToolType": {
+        "type": "string",
+        "enum": [
+          "namespace"
         ]
       },
       "OpenAiResponsesFunctionTool": {
@@ -4900,6 +5110,9 @@
           },
           {
             "$ref": "#/components/schemas/OpenAiShellTool"
+          },
+          {
+            "$ref": "#/components/schemas/OpenAiNamespaceTool"
           }
         ]
       },
@@ -5114,6 +5327,10 @@
               }
             ]
           },
+          "ignore_eos": {
+            "type": "boolean",
+            "description": "Continue generation past EOS until another stop condition is met"
+          },
           "include": {
             "type": [
               "array",
@@ -5250,6 +5467,15 @@
                 "description": "Response format (legacy, prefer `text` field)"
               }
             ]
+          },
+          "seed": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Seed for deterministic request-scoped sampling",
+            "minimum": 0
           },
           "stop": {
             "oneOf": [
@@ -5695,6 +5921,9 @@
                     "name": {
                       "type": "string"
                     },
+                    "namespace": {
+                      "type": "string"
+                    },
                     "type": {
                       "type": "string",
                       "enum": [
@@ -5721,6 +5950,73 @@
                       "type": "string",
                       "enum": [
                         "function_call_output"
+                      ]
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "type"
+                  ],
+                  "properties": {
+                    "content": {
+                      "type": "array",
+                      "items": {
+                        "oneOf": [
+                          {
+                            "type": "object",
+                            "required": [
+                              "text",
+                              "type"
+                            ],
+                            "properties": {
+                              "text": {
+                                "type": "string"
+                              },
+                              "type": {
+                                "type": "string",
+                                "enum": [
+                                  "reasoning_text"
+                                ]
+                              }
+                            }
+                          }
+                        ]
+                      }
+                    },
+                    "id": {
+                      "type": "string"
+                    },
+                    "summary": {
+                      "type": "array",
+                      "items": {
+                        "oneOf": [
+                          {
+                            "type": "object",
+                            "required": [
+                              "text",
+                              "type"
+                            ],
+                            "properties": {
+                              "text": {
+                                "type": "string"
+                              },
+                              "type": {
+                                "type": "string",
+                                "enum": [
+                                  "summary_text"
+                                ]
+                              }
+                            }
+                          }
+                        ]
+                      }
+                    },
+                    "type": {
+                      "type": "string",
+                      "enum": [
+                        "reasoning"
                       ]
                     }
                   }
@@ -6018,6 +6314,84 @@
           },
           {
             "type": "object",
+            "description": "Reasoning text delta",
+            "required": [
+              "sequence_number",
+              "item_id",
+              "output_index",
+              "content_index",
+              "delta",
+              "type"
+            ],
+            "properties": {
+              "content_index": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "delta": {
+                "type": "string"
+              },
+              "item_id": {
+                "type": "string"
+              },
+              "output_index": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "sequence_number": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "response.reasoning_text.delta"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Reasoning text done",
+            "required": [
+              "sequence_number",
+              "item_id",
+              "output_index",
+              "content_index",
+              "text",
+              "type"
+            ],
+            "properties": {
+              "content_index": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "item_id": {
+                "type": "string"
+              },
+              "output_index": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "sequence_number": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "text": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "response.reasoning_text.done"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
             "description": "Response completed event",
             "required": [
               "sequence_number",
@@ -6096,12 +6470,22 @@
             "description": "Error event",
             "required": [
               "sequence_number",
-              "error",
+              "code",
+              "message",
               "type"
             ],
             "properties": {
-              "error": {
-                "$ref": "#/components/schemas/ResponseError"
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              },
+              "param": {
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "sequence_number": {
                 "type": "integer",
@@ -6254,6 +6638,9 @@
               "name": {
                 "type": "string"
               },
+              "namespace": {
+                "type": "string"
+              },
               "status": {
                 "type": "string"
               },
@@ -6327,6 +6714,80 @@
                 ]
               }
             }
+          },
+          {
+            "type": "object",
+            "required": [
+              "type",
+              "id",
+              "summary",
+              "content",
+              "status"
+            ],
+            "properties": {
+              "content": {
+                "type": "array",
+                "items": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "required": [
+                        "text",
+                        "type"
+                      ],
+                      "properties": {
+                        "text": {
+                          "type": "string"
+                        },
+                        "type": {
+                          "type": "string",
+                          "enum": [
+                            "reasoning_text"
+                          ]
+                        }
+                      }
+                    }
+                  ]
+                }
+              },
+              "id": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string"
+              },
+              "summary": {
+                "type": "array",
+                "items": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "required": [
+                        "text",
+                        "type"
+                      ],
+                      "properties": {
+                        "text": {
+                          "type": "string"
+                        },
+                        "type": {
+                          "type": "string",
+                          "enum": [
+                            "summary_text"
+                          ]
+                        }
+                      }
+                    }
+                  ]
+                }
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "reasoning"
+                ]
+              }
+            }
           }
         ]
       },
@@ -6360,6 +6821,19 @@
           }
         }
       },
+      "PromptTokensDetailsResponse": {
+        "type": "object",
+        "required": [
+          "cached_tokens"
+        ],
+        "properties": {
+          "cached_tokens": {
+            "type": "integer",
+            "description": "Prompt tokens served from the prefix cache, not recomputed.",
+            "minimum": 0
+          }
+        }
+      },
       "ReIsqRequest": {
         "type": "object",
         "required": [
@@ -6383,7 +6857,7 @@
               },
               {
                 "$ref": "#/components/schemas/ReasoningEffort",
-                "description": "Effort level for reasoning (low, medium, high)"
+                "description": "Effort level for reasoning (off, low, medium, high, xhigh). \"none\" aliases \"off\"."
               }
             ]
           },
@@ -6394,7 +6868,7 @@
               },
               {
                 "$ref": "#/components/schemas/ReasoningSummary",
-                "description": "Whether to generate a summary of reasoning"
+                "description": "Accepted for compatibility; currently does not change the response."
               }
             ]
           }
@@ -6402,12 +6876,15 @@
       },
       "ReasoningEffort": {
         "type": "string",
-        "description": "Reasoning effort level for models that support extended thinking",
+        "description": "Reasoning effort. `none` aliases `off`; `max` aliases `xhigh`.",
         "enum": [
+          "off",
           "none",
           "low",
           "medium",
-          "high"
+          "high",
+          "xhigh",
+          "max"
         ]
       },
       "ReasoningSummary": {
@@ -6423,24 +6900,17 @@
         "type": "object",
         "description": "Error information for a response",
         "required": [
-          "type",
+          "code",
           "message"
         ],
         "properties": {
           "code": {
-            "type": [
-              "string",
-              "null"
-            ],
+            "type": "string",
             "description": "Error code"
           },
           "message": {
             "type": "string",
             "description": "Error message"
-          },
-          "type": {
-            "type": "string",
-            "description": "Error type"
           }
         }
       },
@@ -6965,7 +7435,7 @@
               "boolean",
               "null"
             ],
-            "description": "Toggle thinking output for models that support it.",
+            "description": "Legacy schema field. The active Responses endpoint ignores this top-level control.",
             "example": null
           },
           "frequency_penalty": {
@@ -6987,6 +7457,11 @@
                 "description": "Constrain output with a regex, JSON schema, Lark, or LLGuidance grammar."
               }
             ]
+          },
+          "ignore_eos": {
+            "type": "boolean",
+            "description": "Continue generation past EOS until another stop condition is met.",
+            "example": false
           },
           "input": {
             "$ref": "#/components/schemas/ResponsesMessages",
@@ -7112,7 +7587,7 @@
               "string",
               "null"
             ],
-            "description": "Reasoning effort level for models that support extended thinking.\nValid values: \"low\", \"medium\", \"high\"",
+            "description": "Legacy schema field. Use `reasoning.effort` with the active Responses endpoint.",
             "example": null
           },
           "reasoning_enabled": {
@@ -7160,6 +7635,16 @@
                 "description": "Force plain text or JSON-schema constrained output."
               }
             ]
+          },
+          "seed": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Seed for deterministic request-scoped sampling.",
+            "example": null,
+            "minimum": 0
           },
           "stop": {
             "oneOf": [

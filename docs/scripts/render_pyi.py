@@ -226,6 +226,9 @@ def _format_signature_block(func_name: str, func: ast.FunctionDef) -> str:
         return s
 
     parts = [fmt(a) for a in args]
+    if func.args.kwonlyargs:
+        positional_count = sum(arg.arg != "self" for arg in func.args.args)
+        parts.insert(positional_count, "*")
     single = f"{func_name}({', '.join(parts)})"
     if ret:
         single += f" -> {ret}"
@@ -540,19 +543,15 @@ def _render_index() -> str:
         "",
         "The `mistralrs` Python package exposes the same engine that powers the `mistralrs` CLI.",
         "",
-        ":::note[Release and current-source APIs]",
-        "This reference is generated from the current source tree. Dynamic LoRA lifecycle entries are newer than the published v0.9.0 package; use a [current source build](/mistral.rs/developer/from-source/) until the next release.",
-        ":::",
-        "",
         "## Install",
         "",
-        "`pip install mistralrs` covers CPU (Linux, Windows) and Metal (macOS arm64). CUDA wheels are GitHub release assets with `+cudaNNN.smNN` versions. See [Python SDK getting started](/mistral.rs/guides/python/getting-started/#installing) for install commands and [hardware support](/mistral.rs/reference/hardware-support/) for compute capabilities.",
+        "`pip install mistralrs` covers CPU (Linux, Windows) and Metal (macOS arm64). CUDA wheels are GitHub release assets with `+cudaNNN.smNN` versions. See [Python SDK getting started](/guides/python/getting-started/#installing) for install commands and [hardware support](/reference/hardware-support/) for compute capabilities.",
         "",
         "```bash",
         "pip install mistralrs                                   # CPU / Metal (PyPI)",
         "# NVIDIA (replace version, CUDA level, and SM)",
-        'pip install "mistralrs==0.9.0+cuda128.sm89" \\',
-        "  --find-links https://github.com/EricLBuehler/mistral.rs/releases/expanded_assets/v0.9.0",
+        'pip install "mistralrs==0.9.2+cuda128.sm89" \\',
+        "  --find-links https://github.com/EricLBuehler/mistral.rs/releases/expanded_assets/v0.9.2",
         "```",
         "",
         "## Pages",
@@ -561,10 +560,10 @@ def _render_index() -> str:
         "| --- | --- |",
     ]
     for title, slug, desc, _ in GROUPS:
-        lines.append(f"| [{title}](/mistral.rs/reference/python/{slug}/) | {desc} |")
+        lines.append(f"| [{title}](/reference/python/{slug}/) | {desc} |")
     lines.append("")
     lines.append(
-        "See [Python getting started](/mistral.rs/guides/python/getting-started/) for a walkthrough and the [Python guides](/mistral.rs/guides/python/) for task-oriented recipes."
+        "See [Python getting started](/guides/python/getting-started/) for a walkthrough and the [Python guides](/guides/python/) for task-oriented recipes."
     )
     lines.append("")
     lines.append("---")

@@ -14,7 +14,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use crate::gdn::{GatedDeltaNet, GdnConfig, GdnInputProjectionKind, GdnLayerCache};
+use crate::gdn::{
+    try_forward_grouped_packed_gdn, GatedDeltaNet, GdnConfig, GdnInputProjectionKind,
+    GdnLayerCache, GdnStateDType, GdnVHeadLayout, PackedGdnLayout,
+};
 use crate::{
     amoe::AnyMoeBaseModelMixin,
     attention::{AttentionMask, SdpaParams},
@@ -23,8 +26,8 @@ use crate::{
         HybridCache, HybridCacheConfig, HybridLayerCache, HybridLayerType, RecurrentLayerConfig,
     },
     layers::{
-        embedding_with_legacy_tied_uqff, linear_no_bias, CausalMasker, GemmaRmsNorm,
-        RotaryEmbedding, Sdpa,
+        contains_tensor_or_weight_source, embedding_with_legacy_tied_uqff, linear_no_bias,
+        CausalMasker, GemmaRmsNorm, RotaryEmbedding, Sdpa,
     },
     layers_masker::PastKvLenCache,
     moe::{MoEExperts, MoEExpertsConfig},
@@ -71,6 +74,8 @@ pub struct Config {
     pub linear_value_head_dim: usize,
     pub linear_num_key_heads: usize,
     pub linear_num_value_heads: usize,
+    #[serde(default)]
+    pub mamba_ssm_dtype: GdnStateDType,
     // MoE config
     #[serde(default = "default_decoder_sparse_step")]
     pub decoder_sparse_step: usize,
@@ -87,6 +92,8 @@ pub struct Config {
     #[serde(default = "default_tie")]
     pub tie_word_embeddings: bool,
     pub quantization_config: Option<QuantizedConfig>,
+    #[serde(default, rename = "_mistralrs_gdn_v_head_layout")]
+    gdn_v_head_layout: GdnVHeadLayout,
 }
 
 #[derive(Debug, Clone)]
@@ -149,6 +156,9 @@ impl GdnConfig for Config {
     }
     fn quantization_config(&self) -> &Option<QuantizedConfig> {
         &self.quantization_config
+    }
+    fn v_head_layout(&self) -> GdnVHeadLayout {
+        self.gdn_v_head_layout
     }
 }
 
@@ -352,6 +362,14 @@ impl FullAttention {
         };
 
         // Apply output gate: y = y * sigmoid(gate)
+        if let Some(res) = crate::ops::try_fused_gated_projection(
+            &gate,
+            &y,
+            crate::layers::Activation::Sigmoid,
+            &*self.o_proj,
+        )? {
+            return Ok(res);
+        }
         let gate = candle_nn::ops::sigmoid(&gate.to_dtype(y.dtype())?)?;
         y = y.broadcast_mul(&gate)?;
 
@@ -500,6 +518,18 @@ enum LayerImpl {
     LinearAttention(GatedDeltaNet),
 }
 
+fn gdn_input_projection_kind(vb: &ShardedVarBuilder) -> GdnInputProjectionKind {
+    if contains_tensor_or_weight_source(vb, "in_proj_b.weight")
+        && contains_tensor_or_weight_source(vb, "in_proj_a.weight")
+    {
+        GdnInputProjectionKind::Split
+    } else if contains_tensor_or_weight_source(vb, "in_proj_qkv.weight") {
+        GdnInputProjectionKind::SplitQkvzGroupedBa
+    } else {
+        GdnInputProjectionKind::Grouped
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PackedGdnSegment {
     token_range: Range<usize>,
@@ -597,7 +627,7 @@ impl DecoderLayer {
         x: &Tensor,
         cache: &mut GdnLayerCache,
         batch_kind: RecurrentBatchKind,
-        packed_query_lens: Option<&[usize]>,
+        packed_layout: Option<&PackedGdnLayout>,
     ) -> Result<Tensor> {
         let gdn = match &self.layer_impl {
             LayerImpl::LinearAttention(gdn) => gdn,
@@ -605,7 +635,8 @@ impl DecoderLayer {
         };
         let residual = x;
         let x = self.input_layernorm.forward(x)?;
-        let gdn_out = if let Some(query_lens) = packed_query_lens {
+        let gdn_out = if let Some(layout) = packed_layout {
+            let query_lens = layout.query_lens();
             if batch_kind != RecurrentBatchKind::Prefill {
                 candle_core::bail!("Qwen3-Next packed GDN cannot run a decode batch");
             }
@@ -633,26 +664,34 @@ impl DecoderLayer {
                 );
             }
 
-            let mut outputs = Vec::with_capacity(segments.len());
-            let mut next_conv_states = Vec::with_capacity(segments.len());
-            let mut next_recurrent_states = Vec::with_capacity(segments.len());
-            for segment in segments {
-                let segment_x =
-                    x.narrow(1, segment.token_range.start, segment.token_range.len())?;
-                let mut segment_cache = GdnLayerCache {
-                    conv_state: cache.conv_state.narrow(0, segment.state_index, 1)?,
-                    recurrent_state: cache.recurrent_state.narrow(0, segment.state_index, 1)?,
-                };
-                outputs.push(mistralrs_quant::with_lora_execution_row_range(
-                    segment.token_range.clone(),
-                    || gdn.forward(&segment_x, &mut segment_cache, RecurrentBatchKind::Prefill),
-                )?);
-                next_conv_states.push(segment_cache.conv_state);
-                next_recurrent_states.push(segment_cache.recurrent_state);
+            if let Some(output) = try_forward_grouped_packed_gdn(gdn, &x, cache, layout)? {
+                output
+            } else {
+                let mut outputs = Vec::with_capacity(segments.len());
+                let mut next_conv_states = Vec::with_capacity(segments.len());
+                let mut next_recurrent_states = Vec::with_capacity(segments.len());
+                for segment in segments {
+                    let segment_x =
+                        x.narrow(1, segment.token_range.start, segment.token_range.len())?;
+                    let mut segment_cache = GdnLayerCache {
+                        conv_state: cache.conv_state.narrow(0, segment.state_index, 1)?,
+                        recurrent_state: cache.recurrent_state.narrow(0, segment.state_index, 1)?,
+                        state_layout: cache.state_layout,
+                        slots: None,
+                        pending_transitions: None,
+                        deferred_state: None,
+                    };
+                    outputs.push(mistralrs_quant::with_lora_execution_row_range(
+                        segment.token_range.clone(),
+                        || gdn.forward(&segment_x, &mut segment_cache, RecurrentBatchKind::Prefill),
+                    )?);
+                    next_conv_states.push(segment_cache.conv_state);
+                    next_recurrent_states.push(segment_cache.recurrent_state);
+                }
+                cache.conv_state = Tensor::cat(&next_conv_states, 0)?;
+                cache.recurrent_state = Tensor::cat(&next_recurrent_states, 0)?;
+                Tensor::cat(&outputs, 1)?
             }
-            cache.conv_state = Tensor::cat(&next_conv_states, 0)?;
-            cache.recurrent_state = Tensor::cat(&next_recurrent_states, 0)?;
-            Tensor::cat(&outputs, 1)?
         } else {
             gdn.forward(&x, cache, batch_kind)?
         };
@@ -686,7 +725,7 @@ impl Model {
     pub fn new(
         cfg: &Config,
         vb: ShardedVarBuilder,
-        _is_gptx: bool,
+        is_gptx: bool,
         normal_loading_metadata: NormalLoadingMetadata,
         attention_mechanism: AttentionImplementation,
     ) -> Result<Self> {
@@ -753,7 +792,7 @@ impl Model {
                         rot_dim,
                         cfg.max_position_embeddings,
                         device,
-                        true,
+                        is_gptx,
                         vb_m.dtype(),
                     )?;
                     e.insert(Arc::new(rope));
@@ -813,15 +852,19 @@ impl Model {
                         &comm,
                     )?)
                 }
-                LayerType::LinearAttention => LayerImpl::LinearAttention(GatedDeltaNet::load(
-                    vb_layer.clone(),
-                    cfg as &dyn GdnConfig,
-                    &*mapper,
-                    i,
-                    normal_loading_metadata.loading_isq,
-                    &comm,
-                    GdnInputProjectionKind::Grouped,
-                )?),
+                LayerType::LinearAttention => {
+                    let vb_linear_attn = vb_layer.pp("linear_attn");
+                    let projection_kind = gdn_input_projection_kind(&vb_linear_attn);
+                    LayerImpl::LinearAttention(GatedDeltaNet::load(
+                        vb_layer.clone(),
+                        cfg as &dyn GdnConfig,
+                        &*mapper,
+                        i,
+                        normal_loading_metadata.loading_isq,
+                        &comm,
+                        projection_kind,
+                    )?)
+                }
             };
 
             let input_layernorm = GemmaRmsNorm::new(
@@ -868,12 +911,12 @@ impl Model {
             recurrent: RecurrentLayerConfig {
                 conv_dim: cfg.linear_conv_dim(),
                 conv_width: cfg.linear_conv_kernel_dim,
-                state_dims: vec![
-                    cfg.linear_num_value_heads,
-                    cfg.linear_key_head_dim,
-                    cfg.linear_value_head_dim,
-                ],
-                recurrent_dtype: Some(DType::F32),
+                state: crate::kv_cache::RecurrentStateSpec::Gdn {
+                    heads: cfg.linear_num_value_heads,
+                    key_dim: cfg.linear_key_head_dim,
+                    value_dim: cfg.linear_value_head_dim,
+                },
+                recurrent_dtype: Some(cfg.mamba_ssm_dtype.dtype()),
             },
         };
         let layer_devices = (0..hybrid_cache_config.layer_types.len())
@@ -932,16 +975,17 @@ impl Model {
             .layer_types
             .iter()
             .any(|lt| matches!(lt, LayerType::LinearAttention));
-        let packed_query_lens = if ctx.flash_params().packed {
-            Some(
-                ctx.paged_input_metadata()
-                    .and_then(|metadata| metadata.query_lens.clone())
-                    .ok_or_else(|| {
-                        candle_core::Error::msg(
-                            "Qwen3-Next packed GDN requires logical query lengths",
-                        )
-                    })?,
-            )
+        let packed_layout = if ctx.flash_params().packed {
+            let query_lens = ctx
+                .paged_input_metadata()
+                .and_then(|metadata| metadata.query_lens.clone())
+                .ok_or_else(|| {
+                    candle_core::Error::msg("Qwen3-Next packed GDN requires logical query lengths")
+                })?;
+            Some(PackedGdnLayout::new(
+                query_lens,
+                ctx.flash_params().cumulative_seqlens_q.clone(),
+            )?)
         } else {
             None
         };
@@ -951,7 +995,8 @@ impl Model {
             );
         }
         if has_linear_attention {
-            if let Some(query_lens) = packed_query_lens.as_deref() {
+            if let Some(layout) = packed_layout.as_ref() {
+                let query_lens = layout.query_lens();
                 if !ctx.is_first_prompt_chunk() {
                     candle_core::bail!("Qwen3-Next packed GDN requires the first prompt chunk");
                 }
@@ -1037,30 +1082,28 @@ impl Model {
                         })?;
                     if let Some(HybridLayerCache::Recurrent(pool)) = hybrid_cache.get_mut(layer_idx)
                     {
-                        let conv_state = pool.gather_conv_state(&indices)?;
-                        let recurrent_state = pool.gather_recurrent_state(&indices)?;
-
-                        let mut gdn_cache = GdnLayerCache {
-                            conv_state,
-                            recurrent_state,
+                        // Packed prefill slices the gathered rows per logical sequence
+                        let mut gdn_cache = if packed_layout.is_some() {
+                            GdnLayerCache::gathered(
+                                pool.gather_conv_state(&indices)?,
+                                pool.gather_recurrent_state(&indices)?,
+                                pool.state_layout(),
+                            )
+                        } else {
+                            GdnLayerCache::checkout(pool, &indices)?
                         };
 
                         x = layer.forward_linear(
                             &x,
                             &mut gdn_cache,
                             recurrent_metadata.batch_kind(),
-                            packed_query_lens.as_deref(),
+                            packed_layout.as_ref(),
                         )?;
 
-                        pool.scatter_conv_state_with_host_indices(
+                        gdn_cache.commit(
+                            pool,
                             &indices,
                             recurrent_metadata.state_indices_host(),
-                            &gdn_cache.conv_state,
-                        )?;
-                        pool.scatter_recurrent_state_with_host_indices(
-                            &indices,
-                            recurrent_metadata.state_indices_host(),
-                            &gdn_cache.recurrent_state,
                         )?;
                     } else {
                         candle_core::bail!(
@@ -1185,7 +1228,99 @@ impl AnyMoeBaseModelMixin for Model {}
 
 #[cfg(test)]
 mod tests {
-    use super::{packed_gdn_segments, validate_packed_gdn_state_rows, PackedGdnSegment};
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::Arc,
+    };
+
+    use candle_core::{DType, Device, Result, Tensor};
+    use mistralrs_quant::{
+        QuantMethod, QuantizedWeightSource, Shard, ShardedSafeTensors, ShardedVarBuilder,
+    };
+
+    use super::{
+        gdn_input_projection_kind, packed_gdn_segments, validate_packed_gdn_state_rows,
+        GdnInputProjectionKind, PackedGdnSegment,
+    };
+
+    struct ProjectionWeightSource(HashSet<String>);
+
+    impl QuantizedWeightSource for ProjectionWeightSource {
+        fn contains(&self, name: &str) -> bool {
+            self.0.contains(name)
+        }
+
+        fn load_linear(
+            &self,
+            _key: &str,
+            _device: &Device,
+            _shard: Shard,
+        ) -> Result<Option<Arc<dyn QuantMethod>>> {
+            unreachable!()
+        }
+
+        fn load_optional_tensor(&self, _name: &str, _device: &Device) -> Result<Option<Tensor>> {
+            unreachable!()
+        }
+
+        fn shard_alignment(&self, _key: &str) -> Result<usize> {
+            Ok(1)
+        }
+
+        fn pack_factor(&self, _dtype: DType) -> Result<usize> {
+            Ok(1)
+        }
+
+        fn pack_factor_for(&self, _key: &str, _dtype: DType) -> Result<Option<usize>> {
+            Ok(Some(1))
+        }
+    }
+
+    fn projection_vb(residual: &[&str], source: &[&str]) -> Result<ShardedVarBuilder> {
+        let tensors = residual
+            .iter()
+            .map(|name| {
+                Ok((
+                    format!("model.layers.0.linear_attn.{name}"),
+                    Tensor::zeros((1, 1), DType::F32, &Device::Cpu)?,
+                ))
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+        let source = source
+            .iter()
+            .map(|name| format!("model.layers.0.linear_attn.{name}"))
+            .collect();
+        Ok(ShardedSafeTensors::wrap(tensors, DType::F32, Device::Cpu)
+            .with_weight_source(Arc::new(ProjectionWeightSource(source)))
+            .pp("model.layers.0.linear_attn"))
+    }
+
+    #[test]
+    fn gdn_projection_kind_reads_residual_and_weight_source_tensors() -> Result<()> {
+        let split = [
+            "in_proj_qkv.weight",
+            "in_proj_z.weight",
+            "in_proj_b.weight",
+            "in_proj_a.weight",
+        ];
+        assert_eq!(
+            gdn_input_projection_kind(&projection_vb(&[], &split)?),
+            GdnInputProjectionKind::Split
+        );
+        assert_eq!(
+            gdn_input_projection_kind(&projection_vb(&split, &[])?),
+            GdnInputProjectionKind::Split
+        );
+        assert_eq!(
+            gdn_input_projection_kind(&projection_vb(&[], &["in_proj_qkv.weight"])?),
+            GdnInputProjectionKind::SplitQkvzGroupedBa
+        );
+        assert_eq!(
+            gdn_input_projection_kind(&projection_vb(&[], &[])?),
+            GdnInputProjectionKind::Grouped
+        );
+        Ok(())
+    }
 
     #[test]
     fn packed_gdn_maps_unequal_queries_to_matching_state_rows() {

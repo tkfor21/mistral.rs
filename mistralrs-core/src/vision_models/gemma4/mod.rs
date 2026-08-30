@@ -17,8 +17,8 @@ use crate::{
         EitherCache, IsqModel, ModelForwardContext, MultimodalModel, NormalLoadingMetadata,
     },
     speculative::{
-        SpeculativeAttachInfo, SpeculativeConfig, SpeculativeProposalBatch,
-        SpeculativeProposeBatchCtx, SpeculativeProposer,
+        SpeculativeAttachInfo, SpeculativeBatchPlan, SpeculativeConfig, SpeculativeGraphState,
+        SpeculativeProposalBatch, SpeculativeProposeBatchCtx, SpeculativeProposer,
     },
     utils::unvarbuilder::UnVarBuilder,
     vision_models::multimodal_layout::{
@@ -228,6 +228,7 @@ impl Gemma4Model {
         attention_mechanism: AttentionImplementation,
     ) -> Result<Self> {
         let vb = vb.pp("model");
+        let non_text_vb = vb.clone().without_lora_registry();
 
         let vision_dtype = if vb.dtype() == DType::F16 {
             DType::F32
@@ -245,11 +246,11 @@ impl Gemma4Model {
                         text_hidden,
                         normal_loading_metadata
                             .mapper
-                            .set_nm_device(vb.pp("vision_embedder"), false)
+                            .set_nm_device(non_text_vb.pp("vision_embedder"), false)
                             .set_dtype(vision_dtype),
                         normal_loading_metadata
                             .mapper
-                            .set_nm_device(vb.pp("embed_vision"), false)
+                            .set_nm_device(non_text_vb.pp("embed_vision"), false)
                             .set_dtype(vision_dtype),
                     )?,
                 ))
@@ -258,7 +259,7 @@ impl Gemma4Model {
                     vision_cfg,
                     normal_loading_metadata
                         .mapper
-                        .set_nm_device(vb.pp("vision_tower"), false)
+                        .set_nm_device(non_text_vb.pp("vision_tower"), false)
                         .set_dtype(vision_dtype),
                 )?;
                 let embedder = multimodal_embedding::Gemma4MultimodalEmbedder::new(
@@ -267,7 +268,7 @@ impl Gemma4Model {
                     vision_cfg.rms_norm_eps,
                     normal_loading_metadata
                         .mapper
-                        .set_nm_device(vb.pp("embed_vision"), false)
+                        .set_nm_device(non_text_vb.pp("embed_vision"), false)
                         .set_dtype(vision_dtype),
                 )?;
                 Some(Gemma4VisionPath::Tower { tower, embedder })
@@ -284,7 +285,7 @@ impl Gemma4Model {
                     audio_cfg.rms_norm_eps,
                     normal_loading_metadata
                         .mapper
-                        .set_nm_device(vb.pp("embed_audio"), false)
+                        .set_nm_device(non_text_vb.pp("embed_audio"), false)
                         .set_dtype(audio_dtype),
                 )?;
                 Some(Gemma4AudioPath::Unified { embedder })
@@ -293,7 +294,7 @@ impl Gemma4Model {
                     audio_cfg,
                     normal_loading_metadata
                         .mapper
-                        .set_nm_device(vb.pp("audio_tower"), false)
+                        .set_nm_device(non_text_vb.pp("audio_tower"), false)
                         .set_dtype(audio_dtype),
                 )?;
                 let audio_hidden = audio_cfg.output_proj_dims.unwrap_or(audio_cfg.hidden_size);
@@ -303,7 +304,7 @@ impl Gemma4Model {
                     audio_cfg.rms_norm_eps,
                     normal_loading_metadata
                         .mapper
-                        .set_nm_device(vb.pp("embed_audio"), false)
+                        .set_nm_device(non_text_vb.pp("embed_audio"), false)
                         .set_dtype(audio_dtype),
                 )?;
                 Some(Gemma4AudioPath::Conformer {
@@ -1037,6 +1038,9 @@ impl MultimodalModel for Gemma4Model {
         self.language_model.model_config_like()
     }
 
+    fn encoder_cache(&self) -> Option<&Mutex<EncoderCacheManager>> {
+        Some(&self.encoder_cache)
+    }
     fn encoder_cache_counters(
         &self,
     ) -> Option<(
@@ -1052,7 +1056,87 @@ impl MultimodalModel for Gemma4Model {
     }
 }
 
+/// The only proposer-facing output of a Gemma 4 target forward is the captured hidden state.
+struct Gemma4SpecGraphState {
+    hidden: Option<Tensor>,
+}
+
+impl SpeculativeGraphState for Gemma4SpecGraphState {
+    fn tensors(&self) -> Vec<Tensor> {
+        self.hidden.iter().cloned().collect()
+    }
+
+    fn with_tensors(
+        &self,
+        tensors: Vec<Tensor>,
+    ) -> candle_core::Result<Box<dyn SpeculativeGraphState>> {
+        if tensors.len() != usize::from(self.hidden.is_some()) {
+            candle_core::bail!("Gemma 4 speculative graph state expects one hidden tensor");
+        }
+        Ok(Box::new(Gemma4SpecGraphState {
+            hidden: tensors.into_iter().next(),
+        }))
+    }
+
+    fn for_real_batch(
+        &self,
+        real_batch: usize,
+    ) -> candle_core::Result<Box<dyn SpeculativeGraphState>> {
+        let hidden = self
+            .hidden
+            .as_ref()
+            .map(|hidden| match hidden.rank() {
+                3 => {
+                    let captured_batch = hidden.dim(0)?;
+                    if real_batch > captured_batch {
+                        candle_core::bail!(
+                            "Gemma 4 speculative batch {real_batch} exceeds captured batch {captured_batch}"
+                        );
+                    }
+                    if real_batch == captured_batch {
+                        Ok(hidden.clone())
+                    } else {
+                        hidden.narrow(0, 0, real_batch)
+                    }
+                }
+                2 if real_batch == 1 => Ok(hidden.clone()),
+                2 => candle_core::bail!(
+                    "Gemma 4 rank-2 speculative hidden state requires batch 1, got {real_batch}"
+                ),
+                rank => candle_core::bail!(
+                    "Gemma 4 speculative hidden state has unsupported rank {rank}"
+                ),
+            })
+            .transpose()?;
+        Ok(Box::new(Self { hidden }))
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 impl crate::speculative::SpeculativeTargetMixin for Gemma4Model {
+    fn take_speculative_graph_state(&self) -> Option<Box<dyn SpeculativeGraphState>> {
+        self.language_model.take_spec_hidden().map(|hidden| {
+            Box::new(Gemma4SpecGraphState { hidden }) as Box<dyn SpeculativeGraphState>
+        })
+    }
+
+    fn install_speculative_graph_state(
+        &self,
+        state: &dyn SpeculativeGraphState,
+    ) -> candle_core::Result<()> {
+        let state = state
+            .as_any()
+            .downcast_ref::<Gemma4SpecGraphState>()
+            .ok_or_else(|| {
+                candle_core::Error::msg("foreign speculative graph state for Gemma 4")
+            })?;
+        self.language_model.set_spec_hidden(state.hidden.clone());
+        Ok(())
+    }
+
     fn attach_speculative(
         &mut self,
         config: SpeculativeConfig,
@@ -1062,7 +1146,11 @@ impl crate::speculative::SpeculativeTargetMixin for Gemma4Model {
             self.language_model.set_store_spec_hidden(false);
             return Ok(None);
         };
-        let assistant = config.model.clone();
+        let Some(assistant) = config.model.clone() else {
+            candle_core::bail!(
+                "Gemma 4 has no built-in MTP head; pass an assistant model with `--mtp-model`."
+            );
+        };
         let runtime = mtp::Gemma4MtpRuntime::load(
             config,
             &self.cfg.text_config,
@@ -1080,11 +1168,12 @@ impl crate::speculative::SpeculativeTargetMixin for Gemma4Model {
         self.mtp.lock().is_ok_and(|mtp| mtp.is_some())
     }
 
-    fn speculative_proposal_len(&self) -> Option<usize> {
+    fn speculative_plan(&self, _batch_size: usize) -> Option<SpeculativeBatchPlan> {
         self.mtp
             .lock()
             .ok()
             .and_then(|mtp| mtp.as_ref().map(SpeculativeProposer::proposal_len))
+            .map(SpeculativeBatchPlan::new)
     }
 
     fn speculative_propose(
@@ -1160,7 +1249,8 @@ mod tests {
     use candle_core::{DType, Device, Tensor};
     use mistralrs_quant::{uqff_version_tensors, ShardedSafeTensors, UqffReader, UqffTensor};
 
-    use super::has_clippable_linear_prefix;
+    use super::{has_clippable_linear_prefix, Gemma4SpecGraphState};
+    use crate::speculative::SpeculativeGraphState;
 
     #[test]
     fn clippable_linears_detect_nested_weights_only_in_uqff() {
@@ -1194,5 +1284,19 @@ mod tests {
             assert!(!linear_vb.contains_tensor("linear.weight"));
             assert!(has_clippable_linear_prefix(&linear_vb));
         }
+    }
+
+    #[test]
+    fn speculative_graph_state_narrows_a_bucket_to_the_live_batch() {
+        let state = Gemma4SpecGraphState {
+            hidden: Some(Tensor::zeros((16, 8, 32), DType::F32, &Device::Cpu).unwrap()),
+        };
+
+        let state = state.for_real_batch(9).unwrap();
+        let state = state
+            .as_any()
+            .downcast_ref::<Gemma4SpecGraphState>()
+            .unwrap();
+        assert_eq!(state.hidden.as_ref().unwrap().dims(), &[9, 8, 32]);
     }
 }

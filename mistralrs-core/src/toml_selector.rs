@@ -181,15 +181,18 @@ pub enum TomlModelSelected {
         /// `tok_model_id` is the local or remote model ID where you can find a `tokenizer_config.json` file.
         /// If the `chat_template` is specified, then it will be treated as a path and used over remote files,
         /// removing all remote accesses.
-        tok_model_id: String,
+        tok_model_id: Option<String>,
 
         /// Quantized model ID to find the `quantized_filename`.
         /// This may be a HF hub repo or a local path.
         quantized_model_id: String,
 
         /// Quantized filename(s).
-        /// May be a single filename, or use a delimiter of " " (a single space) for multiple files.
+        /// May be a single filename, or use semicolons to separate multiple files.
         quantized_filename: String,
+
+        /// Multimodal projector filename(s), separated by semicolons.
+        mmproj_filename: Option<String>,
 
         /// Model data type. Defaults to `auto`.
         #[serde(default = "default_dtype")]
@@ -198,6 +201,21 @@ pub enum TomlModelSelected {
         /// Path to a topology YAML file.
         topology: Option<String>,
 
+        /// ISQ organization.
+        organization: Option<IsqOrganization>,
+
+        /// UQFF output configuration.
+        write_uqff: Option<UqffWriteConfig>,
+
+        /// Imatrix file used while requantizing.
+        imatrix: Option<PathBuf>,
+
+        /// Calibration file used to generate an imatrix while requantizing.
+        calibration_file: Option<PathBuf>,
+
+        /// Automatically resize and pad images to this maximum edge length.
+        max_edge: Option<u32>,
+
         /// Maximum prompt sequence length to expect for this model. This affects automatic device mapping but is not a hard limit.
         #[serde(default = "default_max_seq_len")]
         max_seq_len: usize,
@@ -205,6 +223,21 @@ pub enum TomlModelSelected {
         /// Maximum prompt batch size to expect for this model. This affects automatic device mapping but is not a hard limit.
         #[serde(default = "default_max_batch_size")]
         max_batch_size: usize,
+
+        /// Maximum prompt number of images to expect for automatic device mapping.
+        max_num_images: Option<usize>,
+
+        /// Maximum expected image edge length for automatic device mapping.
+        max_image_length: Option<usize>,
+
+        /// Cache path for Hugging Face models downloaded locally.
+        hf_cache_path: Option<PathBuf>,
+
+        /// Path to a local Matryoshka Transformer configuration CSV file.
+        matformer_config_path: Option<PathBuf>,
+
+        /// Name of the Matryoshka Transformer slice to use.
+        matformer_slice_name: Option<String>,
     },
 
     /// Select a GGUF model with X-LoRA.
@@ -220,7 +253,7 @@ pub enum TomlModelSelected {
         quantized_model_id: String,
 
         /// Quantized filename(s).
-        /// May be a single filename, or use a delimiter of " " (a single space) for multiple files.
+        /// May be a single filename, or use semicolons to separate multiple files.
         quantized_filename: String,
 
         /// Model ID to load X-LoRA from. This may be a HF hub repo or a local path.
@@ -262,7 +295,7 @@ pub enum TomlModelSelected {
         quantized_model_id: String,
 
         /// Quantized filename(s).
-        /// May be a single filename, or use a delimiter of " " (a single space) for multiple files.
+        /// May be a single filename, or use semicolons to separate multiple files.
         quantized_filename: String,
 
         /// Model ID to load LoRA from. This may be a HF hub repo or a local path.
@@ -576,6 +609,7 @@ fn infer_legacy_model_kind(table: &toml::Table) -> Result<&'static str, String> 
         (Some(LegacyModelFamily::LegacyLora), true, false) => Ok("legacy_lora_gguf"),
         (Some(LegacyModelFamily::LegacyLora), true, true) => Ok("legacy_lora_ggml"),
         (Some(LegacyModelFamily::Multimodal), false, _) => Ok("multimodal"),
+        (Some(LegacyModelFamily::Multimodal), true, false) => Ok("gguf"),
         (Some(LegacyModelFamily::Embedding), false, _) => Ok("embedding"),
         (None, true, false) => Ok("gguf"),
         (None, true, true) => Ok("ggml"),
@@ -653,12 +687,18 @@ struct TomlLoaderInnerParams {
     no_kv_cache: bool,
     tokenizer_json: Option<String>,
     jinja_explicit: Option<String>,
+    encoder_cache_memory_bytes: Option<usize>,
+    max_model_len: Option<usize>,
+    hf_config_overrides: Option<crate::HfConfigOverrides>,
 }
 
 pub struct TomlLoaderArgs {
     pub chat_template: Option<String>,
     pub no_kv_cache: bool,
     pub jinja_explicit: Option<String>,
+    pub encoder_cache_memory_bytes: Option<usize>,
+    pub max_model_len: Option<usize>,
+    pub hf_config_overrides: Option<crate::HfConfigOverrides>,
 }
 
 pub fn get_toml_selected_model_dtype(model: &TomlSelector) -> ModelDType {
@@ -701,11 +741,6 @@ pub fn get_toml_selected_model_device_map_params(
             max_batch_size,
             ..
         }
-        | TomlModelSelected::GGUF {
-            max_seq_len,
-            max_batch_size,
-            ..
-        }
         | TomlModelSelected::XLoraGGUF {
             max_seq_len,
             max_batch_size,
@@ -729,6 +764,31 @@ pub fn get_toml_selected_model_device_map_params(
             max_seq_len,
             max_batch_size,
         }),
+        TomlModelSelected::GGUF {
+            ref mmproj_filename,
+            max_seq_len,
+            max_batch_size,
+            max_image_length,
+            max_num_images,
+            ..
+        } => {
+            if mmproj_filename.is_some() {
+                let max_image_length =
+                    max_image_length.unwrap_or(AutoDeviceMapParams::DEFAULT_MAX_IMAGE_LENGTH);
+                Ok(AutoDeviceMapParams::Multimodal {
+                    max_seq_len,
+                    max_batch_size,
+                    max_image_shape: (max_image_length, max_image_length),
+                    max_num_images: max_num_images
+                        .unwrap_or(AutoDeviceMapParams::DEFAULT_MAX_NUM_IMAGES),
+                })
+            } else {
+                Ok(AutoDeviceMapParams::Text {
+                    max_seq_len,
+                    max_batch_size,
+                })
+            }
+        }
         TomlModelSelected::Embedding { .. } => Ok(AutoDeviceMapParams::default_text()),
         TomlModelSelected::MultimodalPlain {
             max_seq_len,
@@ -749,6 +809,27 @@ fn loader_from_selected(
     args: TomlLoaderInnerParams,
     model: TomlModelSelected,
 ) -> anyhow::Result<Box<dyn Loader>> {
+    let supports_hf_config_overrides = matches!(
+        &model,
+        TomlModelSelected::Plain { .. }
+            | TomlModelSelected::Lora { .. }
+            | TomlModelSelected::XLora { .. }
+            | TomlModelSelected::MultimodalPlain { .. }
+    );
+    if args.hf_config_overrides.is_some() && !supports_hf_config_overrides {
+        anyhow::bail!("HF config overrides are supported only for text and multimodal models");
+    }
+    let supports_max_model_len = supports_hf_config_overrides
+        || matches!(
+            &model,
+            TomlModelSelected::GGUF { .. }
+                | TomlModelSelected::LoraGGUF { .. }
+                | TomlModelSelected::XLoraGGUF { .. }
+        );
+    if args.max_model_len.is_some() && !supports_max_model_len {
+        anyhow::bail!("max_model_len is not supported by this model format");
+    }
+
     let loader: Box<dyn Loader> = match model {
         TomlModelSelected::Plain {
             model_id,
@@ -777,6 +858,8 @@ fn loader_from_selected(
                 imatrix,
                 calibration_file,
                 hf_cache_path,
+                hf_config_overrides: args.hf_config_overrides.clone(),
+                max_model_len: args.max_model_len,
                 matformer_config_path: None,
                 matformer_slice_name: None,
             },
@@ -814,6 +897,8 @@ fn loader_from_selected(
                 imatrix: None,
                 calibration_file: None,
                 hf_cache_path,
+                hf_config_overrides: args.hf_config_overrides.clone(),
+                max_model_len: args.max_model_len,
                 matformer_config_path: None,
                 matformer_slice_name: None,
             },
@@ -859,6 +944,8 @@ fn loader_from_selected(
                 imatrix: None,
                 calibration_file: None,
                 hf_cache_path,
+                hf_config_overrides: args.hf_config_overrides.clone(),
+                max_model_len: args.max_model_len,
                 matformer_config_path: None,
                 matformer_slice_name: None,
             },
@@ -874,25 +961,59 @@ fn loader_from_selected(
             tok_model_id,
             quantized_model_id,
             quantized_filename,
+            mmproj_filename,
             topology,
+            organization,
+            write_uqff,
+            imatrix,
+            calibration_file,
+            max_edge,
             dtype: _,
             max_seq_len: _,
             max_batch_size: _,
-        } => GGUFLoaderBuilder::new(
-            args.chat_template,
-            Some(tok_model_id),
-            quantized_model_id,
-            quantized_filename
-                .split(GGUF_MULTI_FILE_DELIMITER)
-                .map(ToOwned::to_owned)
-                .collect::<Vec<_>>(),
-            GGUFSpecificConfig {
-                topology: Topology::from_option_path(topology)?,
-            },
-            args.no_kv_cache,
-            args.jinja_explicit,
-        )
-        .build(),
+            max_num_images: _,
+            max_image_length: _,
+            hf_cache_path,
+            matformer_config_path,
+            matformer_slice_name,
+        } => {
+            let mut builder = GGUFLoaderBuilder::new(
+                args.chat_template,
+                tok_model_id,
+                quantized_model_id,
+                quantized_filename
+                    .split(GGUF_MULTI_FILE_DELIMITER)
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>(),
+                GGUFSpecificConfig {
+                    topology: Topology::from_option_path(topology)?,
+                    organization: organization.unwrap_or_default(),
+                    write_uqff,
+                    imatrix,
+                    calibration_file,
+                    max_edge,
+                    max_model_len: args.max_model_len,
+                    hf_cache_path,
+                    matformer_config_path,
+                    matformer_slice_name,
+                },
+                args.no_kv_cache,
+                args.jinja_explicit,
+            )
+            .with_encoder_cache_memory_bytes(args.encoder_cache_memory_bytes);
+            if let Some(mmproj_filename) = mmproj_filename {
+                builder = builder.with_mmproj_files(
+                    mmproj_filename
+                        .split(GGUF_MULTI_FILE_DELIMITER)
+                        .map(ToOwned::to_owned)
+                        .collect(),
+                );
+            }
+            if let Some(tokenizer_json) = args.tokenizer_json {
+                builder = builder.with_tokenizer_json(tokenizer_json);
+            }
+            builder.build()
+        }
         TomlModelSelected::XLoraGGUF {
             tok_model_id,
             quantized_model_id,
@@ -914,10 +1035,12 @@ fn loader_from_selected(
                 .collect::<Vec<_>>(),
             GGUFSpecificConfig {
                 topology: Topology::from_option_path(topology)?,
+                ..Default::default()
             },
             args.no_kv_cache,
             args.jinja_explicit,
         )
+        .with_encoder_cache_memory_bytes(args.encoder_cache_memory_bytes)
         .with_xlora(
             xlora_model_id,
             serde_json::from_reader(
@@ -946,10 +1069,12 @@ fn loader_from_selected(
                 .collect::<Vec<_>>(),
             GGUFSpecificConfig {
                 topology: Topology::from_option_path(topology)?,
+                ..Default::default()
             },
             args.no_kv_cache,
             args.jinja_explicit,
         )
+        .with_encoder_cache_memory_bytes(args.encoder_cache_memory_bytes)
         .with_lora(
             adapters_model_id,
             serde_json::from_reader(
@@ -1075,7 +1200,8 @@ fn loader_from_selected(
                         .collect::<Vec<_>>()
                 }),
                 max_edge,
-                max_model_len: None,
+                max_model_len: args.max_model_len,
+                hf_config_overrides: args.hf_config_overrides.clone(),
                 calibration_file,
                 imatrix,
                 hf_cache_path,
@@ -1088,6 +1214,7 @@ fn loader_from_selected(
             Some(model_id),
             args.jinja_explicit,
         )
+        .with_encoder_cache_memory_bytes(args.encoder_cache_memory_bytes)
         .build(arch),
         TomlModelSelected::Embedding {
             model_id,
@@ -1129,6 +1256,9 @@ impl TryInto<Box<dyn Loader>> for (TomlSelector, TomlLoaderArgs) {
             no_kv_cache: args.no_kv_cache,
             tokenizer_json: selector.tokenizer_json,
             jinja_explicit: args.jinja_explicit,
+            encoder_cache_memory_bytes: args.encoder_cache_memory_bytes,
+            max_model_len: args.max_model_len,
+            hf_config_overrides: args.hf_config_overrides,
         };
         if selector.speculative.is_some() {
             anyhow::bail!(
@@ -1231,6 +1361,86 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(ggml.model, TomlModelSelected::GGML { .. }));
+    }
+
+    #[test]
+    fn multimodal_gguf_preserves_projector_and_device_map_options() {
+        let selector = toml::from_str::<TomlSelector>(
+            r#"
+                [model]
+                kind = "gguf"
+                quantized_model_id = "weights"
+                quantized_filename = "model.gguf"
+                mmproj_filename = "mmproj.gguf"
+                max_edge = 1280
+                max_seq_len = 8192
+                max_batch_size = 3
+                max_num_images = 4
+                max_image_length = 1152
+                hf_cache_path = "hf-cache"
+                matformer_config_path = "matformer.csv"
+                matformer_slice_name = "small"
+            "#,
+        )
+        .unwrap();
+
+        match get_toml_selected_model_device_map_params(&selector).unwrap() {
+            AutoDeviceMapParams::Multimodal {
+                max_seq_len,
+                max_batch_size,
+                max_image_shape,
+                max_num_images,
+            } => {
+                assert_eq!(max_seq_len, 8192);
+                assert_eq!(max_batch_size, 3);
+                assert_eq!(max_image_shape, (1152, 1152));
+                assert_eq!(max_num_images, 4);
+            }
+            _ => panic!("expected multimodal device-map parameters"),
+        }
+        match selector.model {
+            TomlModelSelected::GGUF {
+                tok_model_id,
+                mmproj_filename,
+                max_edge,
+                hf_cache_path,
+                matformer_config_path,
+                matformer_slice_name,
+                ..
+            } => {
+                assert!(tok_model_id.is_none());
+                assert_eq!(mmproj_filename.as_deref(), Some("mmproj.gguf"));
+                assert_eq!(max_edge, Some(1280));
+                assert_eq!(hf_cache_path, Some(PathBuf::from("hf-cache")));
+                assert_eq!(matformer_config_path, Some(PathBuf::from("matformer.csv")));
+                assert_eq!(matformer_slice_name.as_deref(), Some("small"));
+            }
+            _ => panic!("expected GGUF model"),
+        }
+    }
+
+    #[test]
+    fn legacy_multimodal_gguf_without_kind_is_inferred() {
+        let selector = toml::from_str::<TomlSelector>(
+            r#"
+                [model]
+                quantized_model_id = "weights"
+                quantized_filename = "model.gguf"
+                mmproj_filename = "mmproj.gguf"
+                max_edge = 1280
+                max_num_images = 4
+                max_image_length = 1152
+            "#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            selector.model,
+            TomlModelSelected::GGUF {
+                mmproj_filename: Some(_),
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1398,6 +1608,9 @@ mod tests {
                 chat_template: None,
                 no_kv_cache: false,
                 jinja_explicit: None,
+                encoder_cache_memory_bytes: None,
+                max_model_len: None,
+                hf_config_overrides: None,
             },
         )
             .try_into();

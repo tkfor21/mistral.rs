@@ -317,6 +317,8 @@ impl IsqModel for Model {
     fn residual_tensors(&self) -> Vec<(String, Tensor)> {
         let uvb = UnVarBuilder::new();
 
+        uvb.pp("language_model").extend(self.llm.residual_tensors());
+
         // MM projectors
         uvb.pp("multi_modal_projector.linear_1")
             .add(&self.mm_projector.linear_1);
@@ -391,6 +393,9 @@ impl MultimodalModel for Model {
             image_hashes: vec![],
             packed_layout: None,
         })
+    }
+    fn encoder_cache(&self) -> Option<&Mutex<EncoderCacheManager>> {
+        Some(&self.encoder_cache)
     }
     fn encoder_cache_counters(
         &self,

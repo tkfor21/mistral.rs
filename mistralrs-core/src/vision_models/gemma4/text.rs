@@ -21,8 +21,8 @@ use crate::{
     attention::{flash_backend_supports, AttentionMask, SdpaParams},
     device_map::{DeviceMappedMask, DeviceMapper},
     layers::{
-        embedding, embedding_with_legacy_tied_uqff, Activation, CausalMasker, Mlp, RmsNorm,
-        RotaryEmbedding, Sdpa,
+        contains_tensor_or_weight_source, embedding, embedding_with_legacy_tied_uqff, Activation,
+        CausalMasker, Mlp, RmsNorm, RotaryEmbedding, Sdpa,
     },
     moe::{MoEExperts, MoEExpertsConfig},
     paged_attention::{
@@ -39,6 +39,14 @@ use crate::{
 };
 
 use super::config::{Gemma4BidirectionalAttention, Gemma4TextConfig};
+
+fn gemma4_moe_weight_prefix(vb: &ShardedVarBuilder) -> &'static str {
+    if contains_tensor_or_weight_source(&vb.pp("moe"), "gate_up_proj") {
+        "moe"
+    } else {
+        "experts"
+    }
+}
 
 macro_rules! is_sliding {
     ($layer_idx:expr, $cfg:expr) => {
@@ -197,6 +205,7 @@ struct Gemma4Router {
     norm: RmsNorm,
     scale: Tensor,
     proj: candle_nn::Linear,
+    proj_lora: Option<Arc<mistralrs_quant::LoraSiteHandle>>,
     top_k: usize,
 }
 
@@ -209,8 +218,13 @@ impl Gemma4Router {
         vb: ShardedVarBuilder,
     ) -> Result<Self> {
         let scale = vb.get(hidden_size, "scale")?;
-        let proj_w = vb.pp("proj").get((num_experts, hidden_size), "weight")?;
+        let proj_vb = vb.pp("proj");
+        let proj_w = proj_vb.get((num_experts, hidden_size), "weight")?;
         let proj = candle_nn::Linear::new(proj_w.to_dtype(vb.dtype())?, None);
+        let proj_lora = mistralrs_quant::register_dynamic_lora_site(
+            &proj_vb,
+            mistralrs_quant::LoraLinearSpec::replicated(hidden_size, num_experts),
+        )?;
         // Pre-combine: weight = scale * hidden_size^(-0.5)
         let root_size = (hidden_size as f64).powf(-0.5);
         let combined_weight = (&scale * root_size)?;
@@ -219,6 +233,7 @@ impl Gemma4Router {
             norm,
             scale,
             proj,
+            proj_lora,
             top_k,
         })
     }
@@ -226,9 +241,12 @@ impl Gemma4Router {
     fn forward(&self, xs: &Tensor, per_expert_scale: &Tensor) -> Result<(Tensor, Tensor)> {
         let normed = xs.apply(&self.norm)?;
 
-        let logits = normed
-            .to_dtype(self.proj.weight().dtype())?
-            .apply(&self.proj)?;
+        let router_input = normed.to_dtype(self.proj.weight().dtype())?;
+        let logits = router_input.apply(&self.proj)?;
+        let logits = match &self.proj_lora {
+            Some(site) => mistralrs_quant::apply_dynamic_lora_delta(site, &router_input, logits)?,
+            None => logits,
+        };
 
         let topk = crate::ops::moe_router_topk(
             &logits,
@@ -304,52 +322,90 @@ impl Attention {
             (cfg.global_head_dim, global_kv)
         };
 
-        let q_proj = ColumnParallelLayer::new(
-            hidden_sz,
-            num_heads * head_dim,
-            &cfg.quantization_config,
-            bias,
-            comm,
-            vb.pp("q_proj"),
-        )?;
-
         let is_shared = kv_shared_layer_index.is_some();
-        let (k_proj, v_proj, merged_qkv_proj, k_norm, v_norm_rms) = if is_shared {
-            (None, None, None, None, None)
-        } else {
-            let kv_shard = mistralrs_quant::compute_kv_shard(num_kv_heads, head_dim, comm)?;
-            let k_proj = ColumnParallelLayer::new_with_shard(
+        let (q_proj, k_proj, v_proj, merged_qkv_proj, k_norm, v_norm_rms) = if is_shared {
+            let q_proj = ColumnParallelLayer::new(
                 hidden_sz,
-                num_kv_heads * head_dim,
+                num_heads * head_dim,
                 &cfg.quantization_config,
                 bias,
                 comm,
-                kv_shard,
-                vb.pp("k_proj"),
+                vb.pp("q_proj"),
             )?;
-
+            (q_proj, None, None, None, None, None)
+        } else {
+            let kv_shard = mistralrs_quant::compute_kv_shard(num_kv_heads, head_dim, comm)?;
             let is_k_eq_v = !sliding && cfg.attention_k_eq_v;
-            let v_proj = if is_k_eq_v {
-                None
-            } else {
-                Some(ColumnParallelLayer::new_with_shard(
-                    hidden_sz,
-                    num_kv_heads * head_dim,
-                    &cfg.quantization_config,
-                    bias,
-                    comm,
-                    kv_shard,
-                    vb.pp("v_proj"),
-                )?)
+            let q_shard = mistralrs_quant::Shard::Simple {
+                dim: 0,
+                rank: comm.rank(),
+                world_size: comm.world_size(),
             };
-            let merged_qkv_proj = if let Some(v_proj) = v_proj.as_ref() {
-                crate::ops::MergedDenseProjection::new(&[
-                    q_proj.clone(),
-                    k_proj.clone(),
-                    v_proj.clone(),
-                ])?
+            let kv_dim = num_kv_heads * head_dim;
+            let (names, dims, shards): (&[&str], &[usize], &[mistralrs_quant::Shard]) = if is_k_eq_v
+            {
+                (
+                    &["q_proj", "k_proj"],
+                    &[num_heads * head_dim, kv_dim],
+                    &[q_shard, kv_shard],
+                )
             } else {
-                crate::ops::MergedDenseProjection::new(&[q_proj.clone(), k_proj.clone()])?
+                (
+                    &["q_proj", "k_proj", "v_proj"],
+                    &[num_heads * head_dim, kv_dim, kv_dim],
+                    &[q_shard, kv_shard, kv_shard],
+                )
+            };
+            let packed = ColumnParallelLayer::new_packed(
+                hidden_sz,
+                dims,
+                names,
+                &cfg.quantization_config,
+                bias,
+                comm,
+                Some(shards),
+                vb.clone(),
+            )?;
+            let (q_proj, k_proj, v_proj, merged_qkv_proj) = match &packed {
+                Some(group) => (
+                    group.constituents[0].clone(),
+                    group.constituents[1].clone(),
+                    group.constituents.get(2).cloned(),
+                    Some(crate::ops::MergedDenseProjection::from_packed(group)),
+                ),
+                None => {
+                    let q_proj = ColumnParallelLayer::new(
+                        hidden_sz,
+                        num_heads * head_dim,
+                        &cfg.quantization_config,
+                        bias,
+                        comm,
+                        vb.pp("q_proj"),
+                    )?;
+                    let k_proj = ColumnParallelLayer::new_with_shard(
+                        hidden_sz,
+                        kv_dim,
+                        &cfg.quantization_config,
+                        bias,
+                        comm,
+                        kv_shard,
+                        vb.pp("k_proj"),
+                    )?;
+                    let v_proj = if is_k_eq_v {
+                        None
+                    } else {
+                        Some(ColumnParallelLayer::new_with_shard(
+                            hidden_sz,
+                            kv_dim,
+                            &cfg.quantization_config,
+                            bias,
+                            comm,
+                            kv_shard,
+                            vb.pp("v_proj"),
+                        )?)
+                    };
+                    (q_proj, k_proj, v_proj, None)
+                }
             };
             let k_norm = RmsNorm::new(
                 head_dim,
@@ -362,6 +418,7 @@ impl Attention {
             let v_norm_weight = Tensor::ones(head_dim, vb.dtype(), v_dev)?;
             let v_norm_rms = RmsNorm::from_w(v_norm_weight, cfg.rms_norm_eps)?;
             (
+                q_proj,
                 Some(k_proj),
                 v_proj,
                 merged_qkv_proj,
@@ -984,11 +1041,7 @@ impl DecoderLayer {
                 .unwrap_or(cfg.intermediate_size);
 
             // Support both old ("moe") and new ("experts") weight paths
-            let moe_prefix = if vb.pp("moe").contains_tensor("gate_up_proj") {
-                "moe"
-            } else {
-                "experts"
-            };
+            let moe_prefix = gemma4_moe_weight_prefix(&vb);
             let moe_vb = mapper.set_device(layer_idx, vb.pp(moe_prefix), false);
             let moe_cfg = MoEExpertsConfig {
                 num_experts,
@@ -1419,17 +1472,11 @@ impl ModelConfigLike for Gemma4ModelConfigLike {
         }
     }
 
-    fn kv_cache_elements_per_token(&self) -> usize {
-        let num_layers = self.base.num_layers;
-        let total: usize = (0..num_layers)
-            .map(|i| {
-                let kv_heads = self.num_kv_heads_for_layer(i);
-                let k_dim = self.k_head_dim_for_layer(i);
-                let v_dim = self.v_head_dim_for_layer(i);
-                kv_heads * (k_dim + v_dim)
-            })
-            .sum();
-        total / num_layers
+    fn layer_kv_cache_elements_per_token(&self, layer_idx: usize) -> Option<usize> {
+        let kv_heads = self.num_kv_heads_for_layer(layer_idx);
+        let k_dim = self.k_head_dim_for_layer(layer_idx);
+        let v_dim = self.v_head_dim_for_layer(layer_idx);
+        Some(kv_heads * (k_dim + v_dim))
     }
 }
 
@@ -1863,6 +1910,19 @@ impl TextModel {
         self.last_spec_hidden.lock().ok().and_then(|h| h.clone())
     }
 
+    /// `None` unless a proposer is attached; otherwise the captured hidden state, detached.
+    pub fn take_spec_hidden(&self) -> Option<Option<Tensor>> {
+        self.store_spec_hidden
+            .load(Ordering::Relaxed)
+            .then(|| self.last_spec_hidden.lock().ok().and_then(|mut h| h.take()))
+    }
+
+    pub fn set_spec_hidden(&self, hidden: Option<Tensor>) {
+        if let Ok(mut slot) = self.last_spec_hidden.lock() {
+            *slot = hidden;
+        }
+    }
+
     pub fn set_store_spec_hidden(&self, store: bool) {
         self.store_spec_hidden.store(store, Ordering::Relaxed);
         if !store {
@@ -1949,6 +2009,7 @@ impl TextModel {
         if requires_full_prefill_queries
             || has_bidirectional
             || metadata.is_some_and(|metadata| metadata.has_noncausal_mm_context)
+            || mistralrs_quant::has_active_lora_execution()
         {
             return Ok(None);
         }
@@ -2621,11 +2682,96 @@ impl AnyMoeBaseModelMixin for TextModel {}
 
 #[cfg(test)]
 mod tests {
-    use candle_core::{Device, Tensor};
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::Arc,
+    };
 
     use super::{
-        is_paged_decode_forward, select_paged_mm_prefix_path, sliding_decode_kv_window, TextModel,
+        gemma4_moe_weight_prefix, is_paged_decode_forward, select_paged_mm_prefix_path,
+        sliding_decode_kv_window, Gemma4Router, TextModel,
     };
+    use candle_core::{DType, Device, Tensor};
+    use mistralrs_quant::{
+        QuantMethod, QuantizedWeightSource, Shard, ShardedSafeTensors, ShardedVarBuilder,
+    };
+
+    struct MoePrefixWeightSource(HashSet<String>);
+
+    impl QuantizedWeightSource for MoePrefixWeightSource {
+        fn contains(&self, name: &str) -> bool {
+            self.0.contains(name)
+        }
+
+        fn load_linear(
+            &self,
+            _key: &str,
+            _device: &Device,
+            _shard: Shard,
+        ) -> candle_core::Result<Option<Arc<dyn QuantMethod>>> {
+            unreachable!()
+        }
+
+        fn load_optional_tensor(
+            &self,
+            _name: &str,
+            _device: &Device,
+        ) -> candle_core::Result<Option<Tensor>> {
+            unreachable!()
+        }
+
+        fn shard_alignment(&self, _key: &str) -> candle_core::Result<usize> {
+            Ok(1)
+        }
+
+        fn pack_factor(&self, _dtype: DType) -> candle_core::Result<usize> {
+            Ok(1)
+        }
+
+        fn pack_factor_for(&self, _key: &str, _dtype: DType) -> candle_core::Result<Option<usize>> {
+            Ok(Some(1))
+        }
+    }
+
+    fn gemma4_layer_vb(
+        residual_moe: bool,
+        source_moe: bool,
+    ) -> candle_core::Result<ShardedVarBuilder> {
+        let prefix = "model.layers.0";
+        let tensors = if residual_moe {
+            HashMap::from([(
+                format!("{prefix}.moe.gate_up_proj"),
+                Tensor::zeros((1, 1), DType::F32, &Device::Cpu)?,
+            )])
+        } else {
+            HashMap::new()
+        };
+        let source = if source_moe {
+            HashSet::from([format!("{prefix}.moe.gate_up_proj")])
+        } else {
+            HashSet::new()
+        };
+        Ok(ShardedSafeTensors::wrap(tensors, DType::F32, Device::Cpu)
+            .with_weight_source(Arc::new(MoePrefixWeightSource(source)))
+            .pp(prefix))
+    }
+
+    #[test]
+    fn gemma4_moe_prefix_reads_residual_and_weight_source_tensors() -> candle_core::Result<()> {
+        assert_eq!(
+            gemma4_moe_weight_prefix(&gemma4_layer_vb(true, false)?),
+            "moe"
+        );
+        assert_eq!(
+            gemma4_moe_weight_prefix(&gemma4_layer_vb(false, true)?),
+            "moe"
+        );
+        assert_eq!(
+            gemma4_moe_weight_prefix(&gemma4_layer_vb(false, false)?),
+            "experts"
+        );
+        Ok(())
+    }
 
     #[test]
     fn paged_decode_phase_does_not_depend_on_query_width() {
@@ -2655,6 +2801,49 @@ mod tests {
         assert!(select_paged_mm_prefix_path(true, true, true, true, true, false).is_err());
         assert!(select_paged_mm_prefix_path(true, true, true, true, true, true).unwrap());
         assert!(!select_paged_mm_prefix_path(false, true, true, true, true, false).unwrap());
+    }
+
+    #[test]
+    fn gemma4_router_registers_its_projection_for_dynamic_lora() -> candle_core::Result<()> {
+        let prefix = "model.language_model.layers.0.router";
+        let registry = Arc::new(mistralrs_quant::LoraLayerRegistry::new());
+        let vb = mistralrs_quant::ShardedSafeTensors::wrap_with_dummy_regexes(
+            HashMap::from([
+                (
+                    format!("{prefix}.scale"),
+                    Tensor::ones(4, DType::F32, &Device::Cpu)?,
+                ),
+                (
+                    format!("{prefix}.proj.weight"),
+                    Tensor::zeros((3, 4), DType::F32, &Device::Cpu)?,
+                ),
+            ]),
+            DType::F32,
+            Device::Cpu,
+            None,
+        )
+        .with_lora_registry(registry.clone());
+
+        let _router = Gemma4Router::new(
+            4,
+            3,
+            2,
+            1e-6,
+            vb.pp("model")
+                .pp("language_model")
+                .pp("layers")
+                .pp(0)
+                .pp("router"),
+        )?;
+        let sites = registry.sites();
+        assert_eq!(sites.len(), 1);
+        assert_eq!(
+            sites[0].key().path(),
+            "model.language_model.layers.0.router.proj"
+        );
+        assert_eq!(sites[0].spec().in_features(), 4);
+        assert_eq!(sites[0].spec().out_features(), 3);
+        Ok(())
     }
 
     #[test]

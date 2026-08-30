@@ -97,6 +97,7 @@ impl From<Config> for PhiRopeConfig {
     fn from(val: Config) -> Self {
         PhiRopeConfig {
             rope_scaling: val.rope_scaling,
+            scaling_attn_factor: None,
             max_position_embeddings: val.max_position_embeddings,
             original_max_position_embeddings: val.original_max_position_embeddings,
             rope_theta: val.rope_theta,
@@ -1446,6 +1447,9 @@ impl MultimodalModel for Model {
     }
     fn default_model_specific_args(&self, _input_ids: &Tensor) -> Box<dyn Any> {
         Box::new(Phi3VisionSpecificArgs::default())
+    }
+    fn encoder_cache(&self) -> Option<&Mutex<EncoderCacheManager>> {
+        Some(&self.encoder_cache)
     }
     fn encoder_cache_counters(
         &self,

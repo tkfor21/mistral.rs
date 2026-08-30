@@ -362,8 +362,8 @@ build_features() {
 
             # Add flash attention based on compute capability
             if [ "$cuda_cc" = "90" ]; then
-                features="$features flash-attn-v3"
-                info "Hopper GPU detected - enabling flash-attn-v3"
+                features="$features flash-attn-v3 flash-attn"
+                info "Hopper GPU detected - enabling flash-attn-v3 and flash-attn"
             elif [ "$cuda_cc" -ge 80 ] 2>/dev/null; then
                 features="$features flash-attn"
                 info "Ampere+ GPU detected - enabling flash-attn"
@@ -904,7 +904,7 @@ print_success() {
     echo "  # Run as a local agent (tools, web search, code execution)"
     echo "  mistralrs serve --agent -m google/gemma-4-E4B-it"
     echo ""
-    echo "Docs:     https://ericlbuehler.github.io/mistral.rs/"
+    echo "Docs:     https://docs.mistralrs.dev/"
     echo "Source:   https://github.com/EricLBuehler/mistral.rs"
     echo ""
     if [ -n "$FFMPEG_SKIPPED" ]; then

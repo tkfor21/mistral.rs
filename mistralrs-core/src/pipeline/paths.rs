@@ -27,6 +27,7 @@ use crate::{
 const SAFETENSOR_MATCH: &str = r"model-\d+-of-\d+\.safetensors\b";
 const QUANT_SAFETENSOR_MATCH: &str = r"model\.safetensors\b";
 const CONSOLIDATED_SAFETENSOR_MATCH: &str = r"consolidated\.safetensors\b";
+const SAFETENSOR_INDEX: &str = "model.safetensors.index.json";
 const PICKLE_MATCH: &str = r"pytorch_model-\d{5}-of-\d{5}.((pth)|(pt)|(bin))\b";
 
 #[derive(Clone, Debug)]
@@ -400,31 +401,37 @@ pub fn get_model_paths(
             Ok(files)
         }
         None => {
-            // We only match these patterns for model names
             let safetensor_match = Regex::new(SAFETENSOR_MATCH)?;
             let quant_safetensor_match = Regex::new(QUANT_SAFETENSOR_MATCH)?;
             let consolidated_safetensor_match = Regex::new(CONSOLIDATED_SAFETENSOR_MATCH)?;
             let pickle_match = Regex::new(PICKLE_MATCH)?;
 
             let mut filenames = vec![];
-            let listing = api_dir_list!(api, model_id, true, &revision).filter(|x| {
-                safetensor_match.is_match(x)
-                    || pickle_match.is_match(x)
-                    || quant_safetensor_match.is_match(x)
-                    || consolidated_safetensor_match.is_match(x)
-                    || x == UQFF_RESIDUAL_SAFETENSORS
-            });
-            let safetensors = listing
-                .clone()
-                .filter(|x| x.ends_with(".safetensors"))
-                .collect::<Vec<_>>();
-            let pickles = listing
-                .clone()
+            let repo_files = api_dir_list!(api, model_id, true, &revision).collect::<Vec<_>>();
+            let safetensors = if repo_files.iter().any(|file| file == SAFETENSOR_INDEX) {
+                let index_path = api_get_file!(api, SAFETENSOR_INDEX, model_id, &revision);
+                parse_safetensor_index(&fs::read_to_string(index_path)?)?
+            } else {
+                repo_files
+                    .iter()
+                    .filter(|file| {
+                        safetensor_match.is_match(file)
+                            || quant_safetensor_match.is_match(file)
+                            || consolidated_safetensor_match.is_match(file)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            let pickles = repo_files
+                .iter()
+                .filter(|file| pickle_match.is_match(file))
                 .filter(|x| x.ends_with(".pth") || x.ends_with(".pt") || x.ends_with(".bin"))
+                .cloned()
                 .collect::<Vec<_>>();
-            let uqff_residual = listing
-                .clone()
-                .filter(|x| x == UQFF_RESIDUAL_SAFETENSORS)
+            let uqff_residual = repo_files
+                .iter()
+                .filter(|file| file.as_str() == UQFF_RESIDUAL_SAFETENSORS)
+                .cloned()
                 .collect::<Vec<_>>();
             let files = if !safetensors.is_empty() {
                 // Always prefer safetensors
@@ -452,6 +459,30 @@ pub fn get_model_paths(
     }
 }
 
+fn parse_safetensor_index(contents: &str) -> Result<Vec<String>> {
+    let index: Value = serde_json::from_str(contents)?;
+    let weight_map = index
+        .get("weight_map")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("Safetensors index has no object `weight_map`"))?;
+    let mut files = HashSet::new();
+    for filename in weight_map.values() {
+        let filename = filename
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Safetensors index contains a non-string filename"))?;
+        if !filename.ends_with(".safetensors") {
+            anyhow::bail!("Safetensors index references non-safetensors file `{filename}`")
+        }
+        files.insert(filename.to_string());
+    }
+    if files.is_empty() {
+        anyhow::bail!("Safetensors index has an empty `weight_map`")
+    }
+    let mut files = files.into_iter().collect::<Vec<_>>();
+    files.sort_unstable();
+    Ok(files)
+}
+
 /// Find and parse the appropriate [`ChatTemplate`], and ensure is has a valid [`ChatTemplate.chat_template`].
 /// If the provided `tokenizer_config.json` from [`ModelPaths.get_template_filename`] does not
 /// have a `chat_template`, use the provided one.
@@ -466,7 +497,7 @@ pub fn get_model_paths(
 ///  the chat template is overwritten with this chat template.
 #[allow(clippy::borrowed_box)]
 pub(crate) fn get_chat_template(
-    paths: &Box<dyn ModelPaths>,
+    paths: &dyn ModelPaths,
     jinja_explicit: Option<&String>,
     chat_template_explicit: Option<&String>,
     chat_template_fallback: Option<&String>,
@@ -610,17 +641,6 @@ pub(crate) fn get_chat_template(
         }
     }
 
-    // JINJA explicit
-    if let Some(jinja_explicit) = jinja_explicit {
-        if !jinja_explicit.ends_with(".jinja") {
-            panic!("jinja_explicit must end with .jinja!");
-        }
-
-        let ct = fs::read_to_string(jinja_explicit).expect("Loading chat template failed.");
-
-        template.chat_template = Some(ChatTemplateValue(Either::Left(ct)));
-    }
-
     let processor_conf: Option<crate::vision_models::processor_config::ProcessorConfig> = paths
         .get_processor_config()
         .as_ref()
@@ -631,6 +651,15 @@ pub(crate) fn get_chat_template(
                 .chat_template
                 .map(|x| ChatTemplateValue(Either::Left(x)));
         }
+    }
+
+    if let Some(jinja_explicit) = jinja_explicit {
+        if !jinja_explicit.ends_with(".jinja") {
+            panic!("jinja_explicit must end with .jinja!");
+        }
+
+        let ct = fs::read_to_string(jinja_explicit).expect("Loading chat template failed.");
+        template.chat_template = Some(ChatTemplateValue(Either::Left(ct)));
     }
 
     #[derive(Debug, serde::Deserialize)]
@@ -689,7 +718,38 @@ pub(crate) fn get_chat_template(
     }
 }
 
+#[cfg(test)]
 mod tests {
+    use crate::pipeline::loaders::LocalModelPaths;
+
+    use super::{get_chat_template, parse_safetensor_index, AdapterPaths};
+
+    #[test]
+    fn explicit_jinja_overrides_processor_template() {
+        let dir = tempfile::tempdir().unwrap();
+        let processor_path = dir.path().join("processor_config.json");
+        let jinja_path = dir.path().join("explicit.jinja");
+        std::fs::write(&processor_path, r#"{"chat_template":"processor"}"#).unwrap();
+        std::fs::write(&jinja_path, "explicit").unwrap();
+        let paths = LocalModelPaths {
+            tokenizer_filename: dir.path().join("tokenizer.json"),
+            config_filename: dir.path().join("config.json"),
+            template_filename: None,
+            filenames: Vec::new(),
+            adapter_paths: AdapterPaths::None,
+            gen_conf: None,
+            preprocessor_config: None,
+            video_preprocessor_config: None,
+            processor_config: Some(processor_path),
+            chat_template_json_filename: None,
+        };
+        let jinja_path = jinja_path.to_string_lossy().into_owned();
+
+        let template = get_chat_template(&paths, Some(&jinja_path), None, None, None);
+
+        assert_eq!(template.get_template_contents(), ["explicit"]);
+    }
+
     #[test]
     fn match_safetensors() -> anyhow::Result<()> {
         use regex_automata::meta::Regex;
@@ -716,6 +776,37 @@ mod tests {
             assert!(!safetensor_match.is_match(id));
         }
         Ok(())
+    }
+
+    #[test]
+    fn safetensor_index_drives_arbitrary_shard_names() -> anyhow::Result<()> {
+        let files = parse_safetensor_index(
+            r#"{
+                "metadata": {"total_size": 42},
+                "weight_map": {
+                    "model.embed_tokens.weight": "embeddings.safetensors",
+                    "model.layers.0.weight": "layers-0.safetensors",
+                    "model.layers.0.weight_scale_inv": "layers-0.safetensors",
+                    "model.visual.weight": "vision.safetensors"
+                }
+            }"#,
+        )?;
+        assert_eq!(
+            files,
+            [
+                "embeddings.safetensors",
+                "layers-0.safetensors",
+                "vision.safetensors"
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn safetensor_index_rejects_non_safetensor_shards() {
+        let err = parse_safetensor_index(r#"{"weight_map":{"model.weight":"pytorch_model.bin"}}"#)
+            .unwrap_err();
+        assert!(err.to_string().contains("non-safetensors"));
     }
 
     #[test]
